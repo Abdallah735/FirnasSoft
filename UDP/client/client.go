@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -36,6 +37,17 @@ func main() {
 			}
 			fmt.Println("\n[Server reply]:", string(buffer[:n]))
 			fmt.Print(">> ")
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(26 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, err := conn.Write([]byte("PING"))
+			if err != nil {
+				fmt.Println("Error sending keep-alive:", err)
+			}
 		}
 	}()
 

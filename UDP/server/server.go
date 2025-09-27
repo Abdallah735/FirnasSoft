@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 func main() {
@@ -24,7 +25,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	fmt.Println("UDP server listening on port 8081")
+	fmt.Println("UDP server listening on port 10000")
 
 	clients := make(map[string]*net.UDPAddr)
 	var mu sync.Mutex
@@ -69,6 +70,18 @@ func main() {
 		}
 	}()
 
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			mu.Lock()
+			for _, client := range clients {
+				conn.WriteToUDP([]byte("I remember you"), client)
+			}
+			mu.Unlock()
+		}
+	}()
+
 	buffer := make([]byte, 1024)
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buffer)
@@ -83,10 +96,15 @@ func main() {
 
 		data := make([]byte, n)
 		copy(data, buffer[:n])
-		// if we make hard process it will make another sent message or request wait for it until Doneq
+
 		go func(pkt []byte, addr *net.UDPAddr) {
 			msg := string(pkt)
 			fmt.Printf("Received from %v: %s\n", addr, msg)
+
+			if msg == "PING" {
+				conn.WriteToUDP([]byte("PONG"), addr)
+				return
+			}
 
 			reply := fmt.Sprintf("Echo: %s", msg)
 			_, err := conn.WriteToUDP([]byte(reply), addr)
