@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	serverAddr, err := net.ResolveUDPAddr("udp", "localhost:8081")
+	serverAddr, err := net.ResolveUDPAddr("udp", "173.208.144.109:10000")
 	if err != nil {
 		fmt.Println("Error resolving address:", err)
 		return

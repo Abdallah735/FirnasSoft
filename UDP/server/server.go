@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	addr, err := net.ResolveUDPAddr("udp", ":8081")
+	addr, err := net.ResolveUDPAddr("udp", "173.208.144.109:10000")
 	if err != nil {
 		fmt.Println("Error resolving address:", err)
 		return
@@ -83,7 +83,7 @@ func main() {
 
 		data := make([]byte, n)
 		copy(data, buffer[:n])
-		// if we make hard process it will make another sent message or request wait for it until Done
+		// if we make hard process it will make another sent message or request wait for it until Doneq
 		go func(pkt []byte, addr *net.UDPAddr) {
 			msg := string(pkt)
 			fmt.Printf("Received from %v: %s\n", addr, msg)
