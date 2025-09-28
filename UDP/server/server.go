@@ -73,8 +73,10 @@ func (s *Server) clientManager() {
 	for cmd := range s.commands {
 		switch cmd.typ {
 		case addClient:
+			if _, exists := clients[cmd.addr.String()]; !exists {
+				fmt.Println("New client registered:", cmd.addr)
+			}
 			clients[cmd.addr.String()] = cmd.addr
-			fmt.Println("New client registered:", cmd.addr)
 
 		case sendMessage:
 			if client, ok := clients[cmd.targetKey]; ok {
