@@ -41,7 +41,7 @@ func main() {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(26 * time.Second)
+		ticker := time.NewTicker(28 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			_, err := conn.Write([]byte("PING"))
