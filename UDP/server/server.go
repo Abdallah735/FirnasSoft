@@ -25,98 +25,60 @@ type command struct {
 	replyCh   chan []string
 }
 
-func main() {
-	addr, err := net.ResolveUDPAddr("udp", "173.208.144.109:10000")
-	if err != nil {
-		fmt.Println("Error resolving address:", err)
-		return
-	}
+// ----------------- Server Struct -----------------
+type Server struct {
+	addr     string
+	conn     *net.UDPConn
+	commands chan command
+}
 
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		fmt.Println("Error listening:", err)
-		return
-	}
-	defer conn.Close()
-
-	fmt.Println("UDP server listening on port 10000")
-
-	commands := make(chan command)
-	// Manager goroutine (the only one accessing the map)
-	go clientManager(conn, commands)
-
-	// Goroutine to handle server console input
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			fmt.Print("Server input> ")
-			line, _ := reader.ReadString('\n')
-			line = strings.TrimSpace(line)
-
-			if strings.HasPrefix(line, "send ") {
-				parts := strings.SplitN(line, " ", 3)
-				if len(parts) < 3 {
-					fmt.Println("Usage: send <clientAddr> <message>")
-					continue
-				}
-				commands <- command{
-					typ:       sendMessage,
-					targetKey: parts[1],
-					message:   "[Server] " + parts[2],
-				}
-			} else if line == "list" {
-				replyCh := make(chan []string)
-				commands <- command{typ: listClients, replyCh: replyCh}
-				clients := <-replyCh
-				for _, c := range clients {
-					fmt.Println("Client:", c)
-				}
-			}
-		}
-	}()
-
-	// Main loop: handle client packets
-	buffer := make([]byte, 1024)
-	for {
-		n, clientAddr, err := conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading:", err)
-			continue
-		}
-
-		// Register/update client
-		commands <- command{typ: addClient, addr: clientAddr}
-
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-
-		go func(pkt []byte, addr *net.UDPAddr) {
-			msg := string(pkt)
-			fmt.Printf("Received from %v: %s\n", addr, msg)
-
-			if msg == "PING" {
-				conn.WriteToUDP([]byte("PONG"), addr)
-				return
-			}
-
-			reply := fmt.Sprintf("Echo: %s", msg)
-			conn.WriteToUDP([]byte(reply), addr)
-		}(data, clientAddr)
+// Create new server
+func NewServer(addr string) *Server {
+	return &Server{
+		addr:     addr,
+		commands: make(chan command),
 	}
 }
 
-// clientManager is the only goroutine accessing the map
-func clientManager(conn *net.UDPConn, commands chan command) {
+// Start server
+func (s *Server) Start() error {
+	udpAddr, err := net.ResolveUDPAddr("udp", s.addr)
+	if err != nil {
+		return fmt.Errorf("Error resolving address: %v", err)
+	}
+
+	s.conn, err = net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("Error listening: %v", err)
+	}
+
+	fmt.Println("UDP server listening on", s.addr)
+
+	// Start manager
+	go s.clientManager()
+
+	// Start console input
+	go s.handleInput()
+
+	// Start handling packets
+	s.handlePackets()
+
+	return nil
+}
+
+// Manager goroutine
+func (s *Server) clientManager() {
 	clients := make(map[string]*net.UDPAddr)
 
-	for cmd := range commands {
+	for cmd := range s.commands {
 		switch cmd.typ {
 		case addClient:
 			clients[cmd.addr.String()] = cmd.addr
+			fmt.Println("New client registered:", cmd.addr)
 
 		case sendMessage:
 			if client, ok := clients[cmd.targetKey]; ok {
-				conn.WriteToUDP([]byte(cmd.message), client)
+				s.conn.WriteToUDP([]byte(cmd.message), client)
 			} else {
 				fmt.Println("Client not found:", cmd.targetKey)
 			}
@@ -128,6 +90,78 @@ func clientManager(conn *net.UDPConn, commands chan command) {
 			}
 			cmd.replyCh <- list
 		}
+	}
+}
+
+// Handle console input
+func (s *Server) handleInput() {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("Server input> ")
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "send ") {
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) < 3 {
+				fmt.Println("Usage: send <clientAddr> <message>")
+				continue
+			}
+			s.commands <- command{
+				typ:       sendMessage,
+				targetKey: parts[1],
+				message:   "[Server] " + parts[2],
+			}
+		} else if line == "list" {
+			replyCh := make(chan []string)
+			s.commands <- command{typ: listClients, replyCh: replyCh}
+			clients := <-replyCh
+			for _, c := range clients {
+				fmt.Println("Client:", c)
+			}
+		}
+	}
+}
+
+// Handle client packets
+func (s *Server) handlePackets() {
+	buffer := make([]byte, 1024)
+	for {
+		n, clientAddr, err := s.conn.ReadFromUDP(buffer)
+		if err != nil {
+			fmt.Println("Error reading:", err)
+			continue
+		}
+
+		// Register/update client
+		s.commands <- command{typ: addClient, addr: clientAddr}
+
+		data := make([]byte, n)
+		copy(data, buffer[:n])
+
+		go s.handleMessage(data, clientAddr)
+	}
+}
+
+// Handle single client message
+func (s *Server) handleMessage(pkt []byte, addr *net.UDPAddr) {
+	msg := string(pkt)
+	fmt.Printf("Received from %v: %s\n", addr, msg)
+
+	if msg == "PING" {
+		s.conn.WriteToUDP([]byte("PONG"), addr)
+		return
+	}
+
+	reply := fmt.Sprintf("Echo: %s", msg)
+	s.conn.WriteToUDP([]byte(reply), addr)
+}
+
+// ----------------- main -----------------
+func main() {
+	server := NewServer("173.208.144.109:10000")
+	if err := server.Start(); err != nil {
+		fmt.Println("Server error:", err)
 	}
 }
 

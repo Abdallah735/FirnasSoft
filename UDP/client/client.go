@@ -1,5 +1,4 @@
 // UDP client
-// UDP client
 package main
 
 import (
@@ -11,50 +10,72 @@ import (
 	"time"
 )
 
-func main() {
-	serverAddr, err := net.ResolveUDPAddr("udp", "173.208.144.109:10000")
+// ----------------- Client Struct -----------------
+type Client struct {
+	serverAddr string
+	conn       *net.UDPConn
+}
+
+// Create new client
+func NewClient(serverAddr string) *Client {
+	return &Client{serverAddr: serverAddr}
+}
+
+// Start client
+func (c *Client) Start() error {
+	addr, err := net.ResolveUDPAddr("udp", c.serverAddr)
 	if err != nil {
-		fmt.Println("Error resolving address:", err)
-		return
+		return fmt.Errorf("Error resolving server address: %v", err)
 	}
 
-	conn, err := net.DialUDP("udp", nil, serverAddr)
+	c.conn, err = net.DialUDP("udp", nil, addr)
 	if err != nil {
-		fmt.Println("Error dialing:", err)
-		return
+		return fmt.Errorf("Error connecting to server: %v", err)
 	}
-	defer conn.Close()
 
-	fmt.Println("UDP client started. Type messages and press Enter.")
-	fmt.Println("Type 'exit' to quit.")
+	fmt.Println("UDP client started. Connected to", c.serverAddr)
+	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
 
-	// Listen for replies
-	go func() {
-		buffer := make([]byte, 1024)
-		for {
-			n, _, err := conn.ReadFromUDP(buffer)
-			if err != nil {
-				fmt.Println("Error reading:", err)
-				continue
-			}
-			fmt.Println("\n[Server reply]:", string(buffer[:n]))
-			fmt.Print(">> ")
+	// Listen for server messages
+	go c.listen()
+
+	// Keep-alive
+	go c.keepAlive()
+
+	// Handle user input
+	c.handleInput()
+
+	return nil
+}
+
+// Listen for server replies
+func (c *Client) listen() {
+	buffer := make([]byte, 1024)
+	for {
+		n, _, err := c.conn.ReadFromUDP(buffer)
+		if err != nil {
+			fmt.Println("Error reading from server:", err)
+			continue
 		}
-	}()
+		fmt.Println("\n[Server]:", string(buffer[:n]))
+		fmt.Print(">> ")
+	}
+}
 
-	// Keep alive
-	go func() {
-		ticker := time.NewTicker(28 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			_, err := conn.Write([]byte("PING"))
-			if err != nil {
-				fmt.Println("Error sending keep-alive:", err)
-			}
+// Send PING to keep connection alive
+func (c *Client) keepAlive() {
+	ticker := time.NewTicker(28 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		_, err := c.conn.Write([]byte("PING"))
+		if err != nil {
+			fmt.Println("Error sending keep-alive:", err)
 		}
-	}()
+	}
+}
 
-	// User input
+// Handle console input
+func (c *Client) handleInput() {
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print(">> ")
@@ -66,10 +87,18 @@ func main() {
 			break
 		}
 
-		_, err = conn.Write([]byte(text))
+		_, err := c.conn.Write([]byte(text))
 		if err != nil {
-			fmt.Println("Error writing:", err)
+			fmt.Println("Error sending:", err)
 		}
+	}
+}
+
+// ----------------- main -----------------
+func main() {
+	client := NewClient("173.208.144.109:10000")
+	if err := client.Start(); err != nil {
+		fmt.Println("Client error:", err)
 	}
 }
 
