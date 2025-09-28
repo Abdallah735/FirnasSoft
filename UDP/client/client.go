@@ -10,72 +10,56 @@ import (
 	"time"
 )
 
-// ----------------- Client Struct -----------------
-type Client struct {
-	serverAddr string
+type UDPClient struct {
+	serverAddr *net.UDPAddr
 	conn       *net.UDPConn
 }
 
-// Create new client
-func NewClient(serverAddr string) *Client {
-	return &Client{serverAddr: serverAddr}
+func NewUDPClient(server string) (*UDPClient, error) {
+	addr, err := net.ResolveUDPAddr("udp", server)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving server address: %v", err)
+	}
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, fmt.Errorf("error dialing server: %v", err)
+	}
+
+	return &UDPClient{serverAddr: addr, conn: conn}, nil
 }
 
-// Start client
-func (c *Client) Start() error {
-	addr, err := net.ResolveUDPAddr("udp", c.serverAddr)
-	if err != nil {
-		return fmt.Errorf("Error resolving server address: %v", err)
-	}
-
-	c.conn, err = net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return fmt.Errorf("Error connecting to server: %v", err)
-	}
-
-	fmt.Println("UDP client started. Connected to", c.serverAddr)
+func (c *UDPClient) Start() {
+	fmt.Println("UDP client started. Connected to", c.serverAddr.String())
 	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
 
-	// Listen for server messages
-	go c.listen()
-
-	// Keep-alive
-	go c.keepAlive()
-
-	// Handle user input
-	c.handleInput()
-
-	return nil
-}
-
-// Listen for server replies
-func (c *Client) listen() {
-	buffer := make([]byte, 1024)
-	for {
-		n, _, err := c.conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading from server:", err)
-			continue
+	// Goroutine: listen for server replies
+	go func() {
+		buffer := make([]byte, 1024)
+		for {
+			n, _, err := c.conn.ReadFromUDP(buffer)
+			if err != nil {
+				fmt.Println("Error reading from server:", err)
+				continue
+			}
+			fmt.Println("\n[Server]:", string(buffer[:n]))
+			fmt.Print(">> ")
 		}
-		fmt.Println("\n[Server]:", string(buffer[:n]))
-		fmt.Print(">> ")
-	}
-}
+	}()
 
-// Send PING to keep connection alive
-func (c *Client) keepAlive() {
-	ticker := time.NewTicker(28 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		_, err := c.conn.Write([]byte("PING"))
-		if err != nil {
-			fmt.Println("Error sending keep-alive:", err)
+	// Goroutine: keep-alive PING every 28s
+	go func() {
+		ticker := time.NewTicker(28 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, err := c.conn.Write([]byte("PING"))
+			if err != nil {
+				fmt.Println("Error sending keep-alive:", err)
+			}
 		}
-	}
-}
+	}()
 
-// Handle console input
-func (c *Client) handleInput() {
+	// Main loop: user input
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print(">> ")
@@ -89,17 +73,20 @@ func (c *Client) handleInput() {
 
 		_, err := c.conn.Write([]byte(text))
 		if err != nil {
-			fmt.Println("Error sending:", err)
+			fmt.Println("Error writing to server:", err)
 		}
 	}
 }
 
-// ----------------- main -----------------
 func main() {
-	client := NewClient("173.208.144.109:10000")
-	if err := client.Start(); err != nil {
-		fmt.Println("Client error:", err)
+	client, err := NewUDPClient("173.208.144.109:10000")
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
 	}
+	defer client.conn.Close()
+
+	client.Start()
 }
 
 // package main
