@@ -1,4 +1,5 @@
 // UDP client
+// UDP client
 package main
 
 import (
@@ -27,6 +28,7 @@ func main() {
 	fmt.Println("UDP client started. Type messages and press Enter.")
 	fmt.Println("Type 'exit' to quit.")
 
+	// Listen for replies
 	go func() {
 		buffer := make([]byte, 1024)
 		for {
@@ -40,6 +42,7 @@ func main() {
 		}
 	}()
 
+	// Keep alive
 	go func() {
 		ticker := time.NewTicker(28 * time.Second)
 		defer ticker.Stop()
@@ -51,6 +54,7 @@ func main() {
 		}
 	}()
 
+	// User input
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print(">> ")
