@@ -33,7 +33,6 @@ func (c *UDPClient) Start() {
 	fmt.Println("UDP client started. Connected to", c.serverAddr.String())
 	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
 
-	// Goroutine: listen for server replies
 	go func() {
 		buffer := make([]byte, 1024)
 		for {
@@ -47,7 +46,6 @@ func (c *UDPClient) Start() {
 		}
 	}()
 
-	// Goroutine: keep-alive PING every 28s
 	go func() {
 		ticker := time.NewTicker(28 * time.Second)
 		defer ticker.Stop()
@@ -59,7 +57,6 @@ func (c *UDPClient) Start() {
 		}
 	}()
 
-	// Main loop: user input
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print(">> ")

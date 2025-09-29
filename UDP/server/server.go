@@ -23,20 +23,21 @@ type command struct {
 	targetKey string
 	message   string
 	replyCh   chan []string
+	errCh     chan error
 }
 
 // ----------------- Server Struct -----------------
 type Server struct {
 	addr     string
 	conn     *net.UDPConn
-	commands chan command
+	commands chan *command
 }
 
 // Create new server
 func NewServer(addr string) *Server {
 	return &Server{
 		addr:     addr,
-		commands: make(chan command),
+		commands: make(chan *command),
 	}
 }
 
@@ -70,29 +71,82 @@ func (s *Server) Start() error {
 func (s *Server) clientManager() {
 	clients := make(map[string]*net.UDPAddr)
 
-	for cmd := range s.commands {
-		switch cmd.typ {
-		case addClient:
-			if _, exists := clients[cmd.addr.String()]; !exists {
-				fmt.Println("New client registered:", cmd.addr)
-			}
-			clients[cmd.addr.String()] = cmd.addr
+	for {
+		select {
+		case cmd := <-s.commands:
+			switch cmd.typ {
+			case addClient:
+				if _, exists := clients[cmd.addr.String()]; !exists {
+					fmt.Println("New client registered:", cmd.addr)
+				}
+				clients[cmd.addr.String()] = cmd.addr
+				if cmd.errCh != nil {
+					cmd.errCh <- nil
+				}
 
-		case sendMessage:
-			if client, ok := clients[cmd.targetKey]; ok {
-				s.conn.WriteToUDP([]byte(cmd.message), client)
-			} else {
-				fmt.Println("Client not found:", cmd.targetKey)
-			}
+			case sendMessage:
+				if client, ok := clients[cmd.targetKey]; ok {
+					_, err := s.conn.WriteToUDP([]byte(cmd.message), client)
+					if cmd.errCh != nil {
+						cmd.errCh <- err
+					}
+				} else {
+					if cmd.errCh != nil {
+						cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
+					}
+				}
 
-		case listClients:
-			list := make([]string, 0, len(clients))
-			for k := range clients {
-				list = append(list, k)
+			case listClients:
+				list := make([]string, 0, len(clients))
+				for k := range clients {
+					list = append(list, k)
+				}
+				cmd.replyCh <- list
 			}
-			cmd.replyCh <- list
 		}
 	}
+}
+
+// Send message (clean API for server usage)
+func (s *Server) SendMessage(target, msg string) error {
+	errCh := make(chan error)
+	s.commands <- &command{
+		typ:       sendMessage,
+		targetKey: target,
+		message:   msg,
+		errCh:     errCh,
+	}
+	return <-errCh
+}
+
+// List clients (clean API)
+func (s *Server) ListClients() ([]string, error) {
+	replyCh := make(chan []string)
+	errCh := make(chan error)
+
+	s.commands <- &command{
+		typ:     listClients,
+		replyCh: replyCh,
+		errCh:   errCh,
+	}
+
+	select {
+	case list := <-replyCh:
+		return list, nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
+// Add client (clean API)
+func (s *Server) AddClient(addr *net.UDPAddr) error {
+	errCh := make(chan error)
+	s.commands <- &command{
+		typ:   addClient,
+		addr:  addr,
+		errCh: errCh,
+	}
+	return <-errCh
 }
 
 // Handle console input
@@ -109,15 +163,15 @@ func (s *Server) handleInput() {
 				fmt.Println("Usage: send <clientAddr> <message>")
 				continue
 			}
-			s.commands <- command{
-				typ:       sendMessage,
-				targetKey: parts[1],
-				message:   "[Server] " + parts[2],
+			if err := s.SendMessage(parts[1], "[Server] "+parts[2]); err != nil {
+				fmt.Println("Error:", err)
 			}
 		} else if line == "list" {
-			replyCh := make(chan []string)
-			s.commands <- command{typ: listClients, replyCh: replyCh}
-			clients := <-replyCh
+			clients, err := s.ListClients()
+			if err != nil {
+				fmt.Println("Error:", err)
+				continue
+			}
 			for _, c := range clients {
 				fmt.Println("Client:", c)
 			}
@@ -125,7 +179,7 @@ func (s *Server) handleInput() {
 	}
 }
 
-// Handle client packets
+// Handle incoming packets
 func (s *Server) handlePackets() {
 	buffer := make([]byte, 1024)
 	for {
@@ -135,37 +189,195 @@ func (s *Server) handlePackets() {
 			continue
 		}
 
-		// Register/update client
-		s.commands <- command{typ: addClient, addr: clientAddr}
+		// Register/update client using AddClient method
+		if err := s.AddClient(clientAddr); err != nil {
+			fmt.Println("Error adding client:", err)
+		}
 
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-
-		go s.handleMessage(data, clientAddr)
+		// Print message
+		msg := strings.TrimSpace(string(buffer[:n]))
+		fmt.Printf("Message from %s: %s\n", clientAddr.String(), msg)
 	}
 }
 
-// Handle single client message
-func (s *Server) handleMessage(pkt []byte, addr *net.UDPAddr) {
-	msg := string(pkt)
-	fmt.Printf("Received from %v: %s\n", addr, msg)
-
-	if msg == "PING" {
-		s.conn.WriteToUDP([]byte("PONG"), addr)
-		return
-	}
-
-	reply := fmt.Sprintf("Echo: %s", msg)
-	s.conn.WriteToUDP([]byte(reply), addr)
-}
-
-// ----------------- main -----------------
 func main() {
 	server := NewServer("173.208.144.109:10000")
 	if err := server.Start(); err != nil {
 		fmt.Println("Server error:", err)
 	}
 }
+
+//----------------------------------------
+// package main
+
+// import (
+// 	"bufio"
+// 	"fmt"
+// 	"net"
+// 	"os"
+// 	"strings"
+// )
+
+// type commandType int
+
+// const (
+// 	addClient commandType = iota
+// 	sendMessage
+// 	listClients
+// )
+
+// type command struct {
+// 	typ       commandType
+// 	addr      *net.UDPAddr
+// 	targetKey string
+// 	message   string
+// 	replyCh   chan []string
+// 	//error
+// }
+
+// // ----------------- Server Struct -----------------
+// type Server struct {
+// 	addr     string
+// 	conn     *net.UDPConn
+// 	commands chan command
+// }
+
+// // Create new server
+// func NewServer(addr string) *Server {
+// 	return &Server{
+// 		addr:     addr,
+// 		commands: make(chan command),
+// 	}
+// }
+
+// // Start server
+// func (s *Server) Start() error {
+// 	udpAddr, err := net.ResolveUDPAddr("udp", s.addr)
+// 	if err != nil {
+// 		return fmt.Errorf("Error resolving address: %v", err)
+// 	}
+
+// 	s.conn, err = net.ListenUDP("udp", udpAddr)
+// 	if err != nil {
+// 		return fmt.Errorf("Error listening: %v", err)
+// 	}
+
+// 	fmt.Println("UDP server listening on", s.addr)
+
+// 	// Start manager
+// 	go s.clientManager()
+
+// 	// Start console input
+// 	go s.handleInput()
+
+// 	// Start handling packets
+// 	s.handlePackets()
+
+// 	return nil
+// }
+
+// // Manager goroutine
+// func (s *Server) clientManager() {  //name worker
+// 	clients := make(map[string]*net.UDPAddr)
+
+// 	for cmd := range s.commands {  //use infinity loop
+// 		switch cmd.typ {
+// 		case addClient:
+// 			if _, exists := clients[cmd.addr.String()]; !exists {
+// 				fmt.Println("New client registered:", cmd.addr)
+// 			}
+// 			clients[cmd.addr.String()] = cmd.addr
+
+// 		case sendMessage:
+// 			if client, ok := clients[cmd.targetKey]; ok {
+// 				s.conn.WriteToUDP([]byte(cmd.message), client)
+// 			} else {
+// 				fmt.Println("Client not found:", cmd.targetKey)
+// 			}
+
+// 		case listClients:
+// 			list := make([]string, 0, len(clients))
+// 			for k := range clients {
+// 				list = append(list, k)
+// 			}
+// 			cmd.replyCh <- list
+// 		}
+// 	}
+// }
+
+// // Handle console input
+// func (s *Server) handleInput() {
+// 	reader := bufio.NewReader(os.Stdin)
+// 	for {
+// 		fmt.Print("Server input> ")
+// 		line, _ := reader.ReadString('\n')
+// 		line = strings.TrimSpace(line)
+
+// 		if strings.HasPrefix(line, "send ") {
+// 			parts := strings.SplitN(line, " ", 3)
+// 			if len(parts) < 3 {
+// 				fmt.Println("Usage: send <clientAddr> <message>")
+// 				continue
+// 			}
+// 			s.commands <- command{
+// 				typ:       sendMessage,
+// 				targetKey: parts[1],
+// 				message:   "[Server] " + parts[2],
+// 			}
+// 		} else if line == "list" {
+// 			replyCh := make(chan []string)
+// 			s.commands <- command{typ: listClients, replyCh: replyCh}
+// 			clients := <-replyCh
+// 			for _, c := range clients {
+// 				fmt.Println("Client:", c)
+// 			}
+// 		}
+// 	}
+// }
+
+// // Handle client packets
+// func (s *Server) handlePackets() {
+// 	buffer := make([]byte, 1024)
+// 	for {
+// 		n, clientAddr, err := s.conn.ReadFromUDP(buffer)
+// 		if err != nil {
+// 			fmt.Println("Error reading:", err)
+// 			continue
+// 		}
+
+// 		// Register/update client
+// 		s.commands <- command{typ: addClient, addr: clientAddr}
+
+// 		data := make([]byte, n)
+// 		copy(data, buffer[:n])
+
+// 		go s.handleMessage(data, clientAddr)
+// 	}
+// }
+
+// // Handle single client message
+// func (s *Server) handleMessage(pkt []byte, addr *net.UDPAddr) {
+// 	msg := string(pkt)
+// 	fmt.Printf("Received from %v: %s\n", addr, msg)
+
+// 	if msg == "PING" {
+// 		s.conn.WriteToUDP([]byte("PONG"), addr)
+// 		return
+// 	}
+
+// 	reply := fmt.Sprintf("Echo: %s", msg)
+// 	s.conn.WriteToUDP([]byte(reply), addr)
+// }
+
+// // ----------------- main -----------------
+// func main() {
+// 	server := NewServer("173.208.144.109:10000")
+// 	if err := server.Start(); err != nil {
+// 		fmt.Println("Server error:", err)
+// 	}
+// }
+
+//------------------------------------------------
 
 // package main
 
