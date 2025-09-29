@@ -196,10 +196,10 @@ func (s *Server) handlePackets() {
 
 		// Print message
 		msg := strings.TrimSpace(string(buffer[:n]))
-		fmt.Printf("Message from %s: %s\n", clientAddr.String(), msg)
 		if msg == "PING" {
-			s.conn.Write([]byte("PONG"))
+			s.SendMessage(clientAddr.String(), "PONG")
 		}
+		fmt.Printf("Message from %s: %s\n", clientAddr.String(), msg)
 	}
 }
 
