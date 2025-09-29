@@ -54,7 +54,7 @@ func (c *UDPClient) Start() {
 		for range ticker.C {
 			_, err := c.conn.Write([]byte("PING"))
 			if err != nil {
-				fmt.Println("Error sending keep-alive:", err)
+				fmt.Println("Error sending keep-alive msg:", err)
 			}
 		}
 	}()
