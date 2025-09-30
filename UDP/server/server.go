@@ -56,7 +56,7 @@ func (s *Server) Start() error {
 	fmt.Println("UDP server listening on", s.addr)
 
 	// Start manager
-	go s.clientManager()
+	go s.clientManagerWorker()
 
 	// Start console input
 	go s.handleInput()
@@ -68,7 +68,7 @@ func (s *Server) Start() error {
 }
 
 // Manager goroutine
-func (s *Server) clientManager() {
+func (s *Server) clientManagerWorker() {
 	clients := make(map[string]*net.UDPAddr)
 
 	for {
