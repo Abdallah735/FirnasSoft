@@ -8,8 +8,6 @@ import (
 	"net"
 	"os"
 	"strings"
-
-	"github.com/joho/godotenv"
 )
 
 type commandType int
@@ -210,7 +208,6 @@ func (s *Server) handleInput() {
 			if err := s.SendMessage(parts[1], "[Server] "+parts[2]); err != nil {
 				fmt.Println("Error:", err)
 			}
-
 		} else if line == "list" {
 			clients, err := s.ListClients()
 			if err != nil {
@@ -220,20 +217,6 @@ func (s *Server) handleInput() {
 			for _, c := range clients {
 				fmt.Println("Client:", c)
 			}
-
-		} else if strings.HasPrefix(line, "get ") {
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) < 2 {
-				fmt.Println("Usage: get <clientAddr>")
-				continue
-			}
-			client, err := s.GetClient(parts[1])
-			if err != nil {
-				fmt.Println("Error:", err)
-				continue
-			}
-			fmt.Printf("Client found: %s (IP=%s, Port=%d)\n",
-				client.String(), client.IP.String(), client.Port)
 		}
 	}
 }
@@ -260,18 +243,7 @@ func (s *Server) handlePackets() {
 }
 
 func main() {
-	// Load .env file
-	err := godotenv.Load()
-	if err != nil {
-		fmt.Println("⚠️ Warning: .env file not found, using default address")
-	}
-
-	addr := os.Getenv("SERVER_ADDR")
-	if addr == "" {
-		addr = "0.0.0.0:10000" // default fallback
-	}
-
-	server := NewServer(addr)
+	server := NewServer(":10000")
 	if err := server.Start(); err != nil {
 		fmt.Println("Server error:", err)
 	}
