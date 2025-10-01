@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -15,14 +16,15 @@ const (
 	addClient commandType = iota
 	sendMessage
 	listClients
+	getClient
 )
 
 type command struct {
 	typ       commandType
 	addr      *net.UDPAddr
 	targetKey string
-	message   string
-	replyCh   chan []string
+	message   any
+	replyCh   chan any
 	errCh     chan error
 }
 
@@ -72,43 +74,64 @@ func (s *Server) clientManagerWorker() {
 	clients := make(map[string]*net.UDPAddr)
 
 	for {
-		select {
-		case cmd := <-s.commands:
-			switch cmd.typ {
-			case addClient:
-				if _, exists := clients[cmd.addr.String()]; !exists {
-					fmt.Println("New client registered:", cmd.addr)
-				}
-				clients[cmd.addr.String()] = cmd.addr
-				if cmd.errCh != nil {
-					cmd.errCh <- nil
+		cmd := <-s.commands
+
+		switch cmd.typ {
+		case addClient:
+			clients[cmd.addr.String()] = cmd.addr
+			cmd.errCh <- nil
+
+		case sendMessage:
+			if client, ok := clients[cmd.targetKey]; ok {
+				// نحول أي نوع من الـ message إلى []byte
+				var data []byte
+				switch v := cmd.message.(type) {
+				case string:
+					data = []byte(v)
+				case []byte:
+					data = v
+				default:
+					jsonData, err := json.Marshal(v)
+					if err != nil {
+						cmd.errCh <- fmt.Errorf("unsupported message type: %T", v)
+						continue
+					}
+					data = jsonData
 				}
 
-			case sendMessage:
-				if client, ok := clients[cmd.targetKey]; ok {
-					_, err := s.conn.WriteToUDP([]byte(cmd.message), client)
-					if cmd.errCh != nil {
-						cmd.errCh <- err
-					}
-				} else {
-					if cmd.errCh != nil {
-						cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
-					}
+				n, err := s.conn.WriteToUDP(data, client)
+				if err != nil {
+					cmd.errCh <- err
+					continue
 				}
+				if n != len(data) {
+					cmd.errCh <- fmt.Errorf("incomplete write: wrote %d of %d", n, len(data))
+					continue
+				}
+				cmd.errCh <- nil
+			} else {
+				cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
+			}
 
-			case listClients:
-				list := make([]string, 0, len(clients))
-				for k := range clients {
-					list = append(list, k)
-				}
-				cmd.replyCh <- list
+		case listClients:
+			list := make([]string, 0, len(clients))
+			for k := range clients {
+				list = append(list, k)
+			}
+			cmd.replyCh <- list
+
+		case getClient:
+			if client, ok := clients[cmd.targetKey]; ok {
+				cmd.replyCh <- client
+			} else {
+				cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
 			}
 		}
 	}
 }
 
-// Send message (clean API for server usage)
-func (s *Server) SendMessage(target, msg string) error {
+// Send message
+func (s *Server) SendMessage(target string, msg any) error {
 	errCh := make(chan error)
 	s.commands <- &command{
 		typ:       sendMessage,
@@ -119,9 +142,9 @@ func (s *Server) SendMessage(target, msg string) error {
 	return <-errCh
 }
 
-// List clients (clean API)
+// List clients
 func (s *Server) ListClients() ([]string, error) {
-	replyCh := make(chan []string)
+	replyCh := make(chan any)
 	errCh := make(chan error)
 
 	s.commands <- &command{
@@ -131,14 +154,34 @@ func (s *Server) ListClients() ([]string, error) {
 	}
 
 	select {
-	case list := <-replyCh:
-		return list, nil
+	case data := <-replyCh:
+		return data.([]string), nil
 	case err := <-errCh:
 		return nil, err
 	}
 }
 
-// Add client (clean API)
+// Get client
+func (s *Server) GetClient(addr string) (*net.UDPAddr, error) {
+	replyCh := make(chan any)
+	errCh := make(chan error)
+
+	s.commands <- &command{
+		typ:       getClient,
+		targetKey: addr,
+		replyCh:   replyCh,
+		errCh:     errCh,
+	}
+
+	select {
+	case data := <-replyCh:
+		return data.(*net.UDPAddr), nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
+// Add client
 func (s *Server) AddClient(addr *net.UDPAddr) error {
 	errCh := make(chan error)
 	s.commands <- &command{
@@ -189,7 +232,7 @@ func (s *Server) handlePackets() {
 			continue
 		}
 
-		// Register/update client using AddClient method
+		// Register client
 		if err := s.AddClient(clientAddr); err != nil {
 			fmt.Println("Error adding client:", err)
 		}
