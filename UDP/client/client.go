@@ -1,5 +1,4 @@
 // UDP client
-// client.go
 package main
 
 import (
@@ -244,7 +243,7 @@ WaitMeta:
 }
 
 func main() {
-	client, err := NewUDPClient("127.0.0.1:10000") // replace with server ip if needed
+	client, err := NewUDPClient("173.208.144.109:10000")
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
