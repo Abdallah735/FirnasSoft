@@ -219,8 +219,6 @@ WaitMeta:
 								}
 							}
 						}
-					} else {
-						// other messages: ignore here
 					}
 				case <-ackWait.C:
 					// timeout
