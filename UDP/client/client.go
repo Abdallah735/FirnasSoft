@@ -2,255 +2,247 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
-type UDPClient struct {
-	serverAddr *net.UDPAddr
-	conn       *net.UDPConn
-	recvCh     chan []byte
+type AckMsg struct {
+	Type   string `json:"Type"`
+	FileID string `json:"FileID,omitempty"`
+	Seq    int    `json:"Seq,omitempty"`
+	Path   string `json:"Path,omitempty"`
+	Error  string `json:"Error,omitempty"`
 }
 
-func NewUDPClient(server string) (*UDPClient, error) {
+type registerReq struct {
+	Key string
+	Ch  chan AckMsg
+}
+
+func NewUDPClient(server string) (*net.UDPConn, *net.UDPAddr, error) {
 	addr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
-		return nil, fmt.Errorf("error resolving server address: %v", err)
+		return nil, nil, fmt.Errorf("error resolving server address: %v", err)
 	}
 
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		return nil, fmt.Errorf("error dialing server: %v", err)
+		return nil, nil, fmt.Errorf("error dialing server: %v", err)
 	}
 
-	client := &UDPClient{serverAddr: addr, conn: conn, recvCh: make(chan []byte, 100)}
-	// start receiver loop to push raw messages to recvCh
-	go client.readLoop()
-	return client, nil
+	return conn, addr, nil
 }
 
-func (c *UDPClient) readLoop() {
-	buffer := make([]byte, 70000)
+func startAckDispatcher(incoming chan AckMsg, reg chan registerReq) {
+	// owned map inside dispatcher goroutine
+	waiters := make(map[string]chan AckMsg)
 	for {
-		n, _, err := c.conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading from server:", err)
-			continue
-		}
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-		// push raw bytes to channel; helper sendFile will parse JSON acks
 		select {
-		case c.recvCh <- data:
-		default:
-			// drop if channel full
-		}
-	}
-}
-
-func (c *UDPClient) Start() {
-	fmt.Println("UDP client started. Connected to", c.serverAddr.String())
-	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
-	fmt.Println("To send file: /sendfile <path>")
-
-	go func() {
-		for raw := range c.recvCh {
-			// try parse JSON
-			var m map[string]any
-			_ = json.Unmarshal(raw, &m)
-			if t, ok := m["type"].(string); ok {
-				switch t {
-				case "ack":
-					// print or ignore (SendFile listens on recvCh too)
-					// fmt.Println("ACK", m)
-				default:
-					// print other server msgs
-					fmt.Println("\n[Server RAW]:", string(raw))
-					fmt.Print(">> ")
-				}
+		case r := <-reg:
+			waiters[r.Key] = r.Ch
+		case ack := <-incoming:
+			key := ack.FileID + "#" + fmt.Sprint(ack.Seq)
+			if ch, ok := waiters[key]; ok {
+				// deliver and remove waiter
+				ch <- ack
+				delete(waiters, key)
 			} else {
-				fmt.Println("\n[Server]:", string(raw))
-				fmt.Print(">> ")
-			}
-		}
-	}()
-
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Print(">> ")
-		text, _ := reader.ReadString('\n')
-		text = strings.TrimSpace(text)
-
-		if text == "exit" {
-			fmt.Println("Client exiting...")
-			break
-		}
-		if strings.HasPrefix(text, "/sendfile ") {
-			path := strings.TrimSpace(strings.TrimPrefix(text, "/sendfile "))
-			if err := c.SendFile(path); err != nil {
-				fmt.Println("SendFile error:", err)
-			}
-			continue
-		}
-
-		_, err := c.conn.Write([]byte(text))
-		if err != nil {
-			fmt.Println("Error writing to server:", err)
-		}
-	}
-}
-
-// SendFile: split file to chunks, send meta, wait meta_ack, send chunks with retries on lack of ack
-func (c *UDPClient) SendFile(path string) error {
-	const chunkSize = 65000
-	const ackTimeout = 3 * time.Second
-	const maxRetries = 5
-
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	fi, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	totalSize := fi.Size()
-	filename := filepath.Base(path)
-	totalChunks := int((totalSize + int64(chunkSize) - 1) / int64(chunkSize))
-
-	// 1) send meta
-	meta := map[string]any{
-		"type":     "meta",
-		"filename": filename,
-		"size":     totalSize,
-	}
-	metaB, _ := json.Marshal(meta)
-	if _, err := c.conn.Write(append(metaB, '\n', '\n')); err != nil {
-		return err
-	}
-
-	// wait for meta_ack
-	fileID := ""
-	metaAckDeadline := time.Now().Add(5 * time.Second)
-WaitMeta:
-	for time.Now().Before(metaAckDeadline) {
-		select {
-		case raw := <-c.recvCh:
-			var resp map[string]any
-			_ = json.Unmarshal(raw, &resp)
-			if resp["type"] == "meta_ack" {
-				if id, ok := resp["file_id"].(string); ok {
-					fileID = id
-					break WaitMeta
-				}
-			}
-		case <-time.After(200 * time.Millisecond):
-			// continue waiting
-		}
-	}
-	if fileID == "" {
-		return fmt.Errorf("no meta_ack received from server")
-	}
-	fmt.Println("Received file_id:", fileID, "totalChunks:", totalChunks)
-
-	// Prepare a map to track acked sequences
-	acked := make(map[int]bool)
-
-	// read and send chunks sequentially (could be parallelized but keep simple)
-	for seq := 0; seq < totalChunks; seq++ {
-		offset := int64(seq) * int64(chunkSize)
-		remain := totalSize - offset
-		toRead := chunkSize
-		if remain < int64(chunkSize) {
-			toRead = int(remain)
-		}
-		buf := make([]byte, toRead)
-		_, err := file.ReadAt(buf, offset)
-		if err != nil && err.Error() != "EOF" {
-			return err
-		}
-
-		// prepare header
-		hdr := map[string]any{
-			"type":    "chunk",
-			"file_id": fileID,
-			"seq":     seq,
-			"offset":  offset,
-			"size":    len(buf),
-		}
-		hdrB, _ := json.Marshal(hdr)
-		packet := append(hdrB, []byte("\n\n")...)
-		packet = append(packet, buf...)
-
-		// send with retries until ACK
-		sent := false
-		for attempt := 0; attempt < maxRetries && !sent; attempt++ {
-			_, err := c.conn.Write(packet)
-			if err != nil {
-				return err
-			}
-
-			// wait for ack for this seq
-			ackWait := time.NewTimer(ackTimeout)
-			ackReceived := false
-		ACK_LOOP:
-			for {
-				select {
-				case raw := <-c.recvCh:
-					var resp map[string]any
-					_ = json.Unmarshal(raw, &resp)
-					if resp["type"] == "ack" {
-						if fid, ok := resp["file_id"].(string); ok && fid == fileID {
-							if seqF, ok := resp["seq"].(float64); ok {
-								if int(seqF) == seq {
-									acked[seq] = true
-									ackReceived = true
-									ackWait.Stop()
-									break ACK_LOOP
-								}
-							}
-						}
+				// maybe a FILEID or COMPLETE message (no seq)
+				if ack.Type == "FILEID" || ack.Type == "COMPLETE" || ack.Type == "ERROR" {
+					key2 := ack.FileID + "#-1"
+					if ch2, ok2 := waiters[key2]; ok2 {
+						ch2 <- ack
+						delete(waiters, key2)
 					}
-				case <-ackWait.C:
-					// timeout
-					break ACK_LOOP
 				}
-			}
-			if ackReceived {
-				sent = true
-			} else {
-				// retry
-				fmt.Printf("Retry chunk seq=%d attempt=%d\n", seq, attempt+1)
+				// otherwise ignore or log
 			}
 		}
-		if !sent {
-			return fmt.Errorf("failed to send chunk %d after %d attempts", seq, maxRetries)
-		}
-		// small sleep to avoid flooding
-		time.Sleep(5 * time.Millisecond)
 	}
-
-	fmt.Println("File sent successfully")
-	return nil
 }
 
 func main() {
-	client, err := NewUDPClient("173.208.144.109:10000")
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: client <server:port> <file-to-send>")
+		return
+	}
+	server := os.Args[1]
+	filePath := os.Args[2]
+
+	conn, serverAddr, err := NewUDPClient(server)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
-	defer client.conn.Close()
+	defer conn.Close()
 
-	client.Start()
+	fmt.Println("UDP client started. Connected to", serverAddr.String())
+
+	// reader goroutine: parse incoming JSON messages and push to incoming channel
+	incoming := make(chan AckMsg, 100)
+	reg := make(chan registerReq, 100)
+	go startAckDispatcher(incoming, reg)
+
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				fmt.Println("Read error:", err)
+				return
+			}
+			var a AckMsg
+			if err := json.Unmarshal(buf[:n], &a); err == nil {
+				incoming <- a
+			} else {
+				fmt.Println("server:", string(buf[:n]))
+			}
+		}
+	}()
+
+	// read file
+	finfo, err := os.Stat(filePath)
+	if err != nil {
+		fmt.Println("file stat error:", err)
+		return
+	}
+	size := finfo.Size()
+	fileName := filepath.Base(filePath)
+
+	const chunkSize = 60 * 1024 // 60KB safe chunk
+	totalParts := int((size + int64(chunkSize) - 1) / int64(chunkSize))
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		fmt.Println("open error:", err)
+		return
+	}
+	defer f.Close()
+
+	// read and send first chunk with metadata so server will generate fileID
+	buf := make([]byte, chunkSize)
+	n, _ := f.Read(buf)
+	firstChunk := buf[:n]
+
+	hdr := map[string]any{
+		"Type":      "FIRST",
+		"FileName":  fileName,
+		"FileSize":  size,
+		"Seq":       0,
+		"ChunkSize": chunkSize,
+	}
+	hdrB, _ := json.Marshal(hdr)
+	packet := append(hdrB, '\n')
+	packet = append(packet, firstChunk...)
+
+	// register a waiter for FILEID (key fileid#-1)
+	waitKeyCh := make(chan AckMsg, 1)
+	// use a temporary key "-1" until server returns fileID; dispatcher will match FileID#-1 later
+	reg <- registerReq{Key: "-1", Ch: waitKeyCh}
+
+	_, err = conn.Write(packet)
+	if err != nil {
+		fmt.Println("write error:", err)
+		return
+	}
+
+	// wait for FILEID response
+	var fileID string
+	select {
+	case a := <-waitKeyCh:
+		if a.Type == "FILEID" {
+			fileID = a.FileID
+			fmt.Println("Received FileID from server:", fileID)
+		} else if a.Type == "ERROR" {
+			fmt.Println("Server error:", a.Error)
+			return
+		} else {
+			fmt.Println("Unexpected server response:", a)
+			return
+		}
+	case <-time.After(5 * time.Second):
+		fmt.Println("timeout waiting for fileID")
+		return
+	}
+
+	// Now we'll send remaining parts (if any). For simplicity resending logic is here:
+	// for each seq: send -> register (fileID#seq) -> wait for ACK with timeout -> if timeout retry up to retries
+	retries := 5
+
+	// we've already sent seq 0; if more parts exist send them
+	for seq := 1; seq < totalParts; seq++ {
+		offset := int64(seq) * int64(chunkSize)
+		_, err := f.Seek(offset, 0)
+		if err != nil {
+			fmt.Println("seek error:", err)
+			return
+		}
+		n, _ := f.Read(buf)
+		chunk := buf[:n]
+
+		hdr := map[string]any{
+			"Type":   "CHUNK",
+			"FileID": fileID,
+			"Seq":    seq,
+		}
+		hdrB, _ := json.Marshal(hdr)
+		packet := append(hdrB, '\n')
+		packet = append(packet, chunk...)
+
+		key := fileID + "#" + fmt.Sprint(seq)
+
+		sent := false
+		for attempt := 0; attempt < retries && !sent; attempt++ {
+			waitCh := make(chan AckMsg, 1)
+			reg <- registerReq{Key: key, Ch: waitCh}
+
+			_, err := conn.Write(packet)
+			if err != nil {
+				fmt.Println("write error:", err)
+				return
+			}
+
+			select {
+			case a := <-waitCh:
+				if a.Type == "ACK" && a.Seq == seq {
+					// ok
+					fmt.Printf("ACK for seq %d\n", seq)
+					sent = true
+					break
+				} else if a.Type == "ERROR" {
+					fmt.Println("server error:", a.Error)
+					// decide: retry or abort
+				}
+			case <-time.After(2 * time.Second):
+				fmt.Printf("timeout waiting ACK for seq %d (attempt %d)\n", seq, attempt+1)
+				// loop to retry
+			}
+		}
+		if !sent {
+			fmt.Printf("failed to send seq %d after %d attempts\n", seq, retries)
+			return
+		}
+	}
+
+	// wait for COMPLETE
+	completeKey := fileID + "#-1"
+	completeCh := make(chan AckMsg, 1)
+	reg <- registerReq{Key: completeKey, Ch: completeCh}
+
+	select {
+	case a := <-completeCh:
+		if a.Type == "COMPLETE" {
+			fmt.Println("Server reports file stored at:", a.Path)
+		} else {
+			fmt.Println("Got message:", a)
+		}
+	case <-time.After(10 * time.Second):
+		fmt.Println("timeout waiting for COMPLETE")
+	}
 }
 
 //------------------------------------------
