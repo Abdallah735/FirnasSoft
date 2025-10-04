@@ -3,12 +3,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -20,7 +20,7 @@ const (
 	sendMessage
 	listClients
 	getClient
-	recvPacket // NEW: packet delivered to manager for processing
+	processChunk
 )
 
 type command struct {
@@ -30,53 +30,36 @@ type command struct {
 	message   any
 	replyCh   chan any
 	errCh     chan error
+
+	// for chunk handling
+	rawData []byte
+	n       int
 }
 
-// Packet header exchanged in UDP packets (header JSON then '\n' then payload)
-type PacketHeader struct {
-	Type        string `json:"type"`                   // "INIT", "CHUNK", "ACK_INIT", "ACK_CHUNK", "ACK_COMPLETE"
-	Filename    string `json:"filename,omitempty"`     // for INIT
-	Filesize    int64  `json:"filesize,omitempty"`     // for INIT
-	ChunkSeq    int    `json:"seq,omitempty"`          // for CHUNK / ACK_CHUNK
-	ChunkSize   int    `json:"chunk_size,omitempty"`   // used in INIT (suggested)
-	FileID      string `json:"file_id,omitempty"`      // assigned by server
-	TotalChunks int    `json:"total_chunks,omitempty"` // used in INIT
-	Reason      string `json:"reason,omitempty"`       // optional
-}
-
-type ReceivedPacket struct {
-	From   *net.UDPAddr
-	Header PacketHeader
-	Data   []byte
-}
-
-type Transfer struct {
-	FileID      string
-	Filename    string
-	Filesize    int64
-	ChunkSize   int
-	TotalChunks int
-	Received    map[int]bool
-	FilePath    string
-	File        *os.File
-	Owner       *net.UDPAddr
-	CreatedAt   time.Time
-}
-
+// Server structure
 type Server struct {
 	addr     string
 	conn     *net.UDPConn
 	commands chan *command
 }
 
-// NewServer creates server
 func NewServer(addr string) *Server {
-	// seed rand for file id generation
-	rand.Seed(time.Now().UnixNano())
 	return &Server{
 		addr:     addr,
 		commands: make(chan *command),
 	}
+}
+
+// bookkeeping per file (accessed only inside manager goroutine)
+type FileReceive struct {
+	fileID       string
+	ownerAddr    string
+	filePath     string
+	file         *os.File
+	totalSize    int64
+	chunkSize    int
+	received     map[int]bool
+	lastActivity time.Time
 }
 
 func (s *Server) Start() error {
@@ -92,21 +75,21 @@ func (s *Server) Start() error {
 
 	fmt.Println("UDP server listening on", s.addr)
 
-	// Start manager
+	// start manager
 	go s.clientManagerWorker()
 
-	// Start console input
+	// console input (send/list)
 	go s.handleInput()
 
-	// Start handling packets
-	s.handlePackets()
+	// handle packets
+	go s.handlePackets()
 
 	return nil
 }
 
 func (s *Server) clientManagerWorker() {
 	clients := make(map[string]*net.UDPAddr)
-	transfers := make(map[string]*Transfer) // fileID -> Transfer
+	files := make(map[string]*FileReceive)
 
 	for {
 		cmd := <-s.commands
@@ -132,7 +115,6 @@ func (s *Server) clientManagerWorker() {
 					}
 					data = jsonData
 				}
-
 				n, err := s.conn.WriteToUDP(data, client)
 				if err != nil {
 					cmd.errCh <- err
@@ -161,126 +143,174 @@ func (s *Server) clientManagerWorker() {
 				cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
 			}
 
-		case recvPacket:
-			rp, ok := cmd.message.(*ReceivedPacket)
-			if !ok {
-				if cmd.errCh != nil {
-					cmd.errCh <- fmt.Errorf("invalid recvPacket message")
+		case processChunk:
+			// parse header JSON until newline, then payload
+			buf := cmd.rawData[:cmd.n]
+			idx := -1
+			for i := 0; i < len(buf); i++ {
+				if buf[i] == '\n' {
+					idx = i
+					break
 				}
+			}
+			if idx == -1 {
+				fmt.Println("Invalid chunk packet: no header newline")
+				continue
+			}
+			headerJSON := string(buf[:idx])
+			payload := buf[idx+1 : cmd.n]
+
+			var hdr struct {
+				First     bool   `json:"first"`
+				Seq       int    `json:"seq"`
+				ChunkSize int    `json:"chunk_size"`
+				TotalSize int64  `json:"total_size,omitempty"`
+				FileName  string `json:"file_name,omitempty"`
+				FileID    string `json:"file_id,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(headerJSON), &hdr); err != nil {
+				fmt.Println("Header unmarshal error:", err)
 				continue
 			}
 
-			// handle INIT and CHUNK
-			switch rp.Header.Type {
-			case "INIT":
-				// create unique fileID
-				fileID := fmt.Sprintf("%d_%d", time.Now().UnixNano(), rand.Intn(1e6))
-				uploadsDir := "uploads"
-				_ = os.MkdirAll(uploadsDir, 0o755)
-				safeName := filepath.Base(rp.Header.Filename)
-				filePath := filepath.Join(uploadsDir, fmt.Sprintf("%s_%s.tmp", fileID, safeName))
+			sender := cmd.addr.String()
 
-				// create and truncate file to full size
+			if hdr.First {
+				// create new file receive
+				r := make([]byte, 12)
+				if _, err := rand.Read(r); err != nil {
+					fmt.Println("rand error:", err)
+					continue
+				}
+				fileID := hex.EncodeToString(r)
+				fileName := hdr.FileName
+				if fileName == "" {
+					fileName = "upload"
+				}
+				filePath := "./received_" + fileID + "_" + sanitize(fileName)
+
 				f, err := os.Create(filePath)
 				if err != nil {
 					fmt.Println("Error creating file:", err)
-					// reply NAK?
-					resp := PacketHeader{Type: "ACK_INIT", FileID: "", Reason: "server_file_create_error"}
-					s.sendHeaderTo(resp, rp.From)
 					continue
 				}
-				if err := f.Truncate(rp.Header.Filesize); err != nil {
-					fmt.Println("Error truncating file:", err)
-					f.Close()
-					resp := PacketHeader{Type: "ACK_INIT", FileID: "", Reason: "server_truncate_error"}
-					s.sendHeaderTo(resp, rp.From)
-					continue
+				if hdr.TotalSize > 0 {
+					if err := f.Truncate(hdr.TotalSize); err != nil {
+						fmt.Println("Warning: truncate failed:", err)
+					}
 				}
 
-				tr := &Transfer{
-					FileID:      fileID,
-					Filename:    safeName,
-					Filesize:    rp.Header.Filesize,
-					ChunkSize:   rp.Header.ChunkSize,
-					TotalChunks: rp.Header.TotalChunks,
-					Received:    make(map[int]bool),
-					FilePath:    filePath,
-					File:        f,
-					Owner:       rp.From,
-					CreatedAt:   time.Now(),
+				fr := &FileReceive{
+					fileID:       fileID,
+					ownerAddr:    sender,
+					filePath:     filePath,
+					file:         f,
+					totalSize:    hdr.TotalSize,
+					chunkSize:    hdr.ChunkSize,
+					received:     make(map[int]bool),
+					lastActivity: time.Now(),
 				}
-				transfers[fileID] = tr
-
-				// send ACK_INIT with file_id
-				resp := PacketHeader{Type: "ACK_INIT", FileID: fileID}
-				s.sendHeaderTo(resp, rp.From)
-				fmt.Printf("INIT received from %s -> fileID=%s filename=%s size=%d chunks=%d\n", rp.From.String(), fileID, safeName, rp.Header.Filesize, rp.Header.TotalChunks)
-
-			case "CHUNK":
-				fileID := rp.Header.FileID
-				tr, ok := transfers[fileID]
-				if !ok {
-					// unknown file_id -> ask re-init
-					resp := PacketHeader{Type: "ACK_CHUNK", FileID: fileID, ChunkSeq: rp.Header.ChunkSeq, Reason: "unknown_file_id"}
-					s.sendHeaderTo(resp, rp.From)
-					continue
-				}
-
-				seq := rp.Header.ChunkSeq
-				offset := int64(seq) * int64(tr.ChunkSize)
+				files[fileID] = fr
 
 				// write payload at offset
-				if len(rp.Data) > 0 {
-					n, err := tr.File.WriteAt(rp.Data, offset)
-					if err != nil || n != len(rp.Data) {
-						fmt.Printf("Error writing chunk %d for %s: %v (wrote %d of %d)\n", seq, fileID, err, n, len(rp.Data))
-						resp := PacketHeader{Type: "ACK_CHUNK", FileID: fileID, ChunkSeq: seq, Reason: "write_error"}
-						s.sendHeaderTo(resp, rp.From)
-						continue
-					}
+				offset := int64(hdr.Seq) * int64(hdr.ChunkSize)
+				if _, err := f.WriteAt(payload, offset); err != nil {
+					fmt.Println("WriteAt error:", err)
+				} else {
+					fr.received[hdr.Seq] = true
+					fr.lastActivity = time.Now()
+					fmt.Printf("Received first chunk for file %s from %s seq=%d size=%d\n", fileID, sender, hdr.Seq, len(payload))
 				}
 
-				// mark received
-				tr.Received[seq] = true
-				// ack the chunk
-				resp := PacketHeader{Type: "ACK_CHUNK", FileID: fileID, ChunkSeq: seq}
-				s.sendHeaderTo(resp, rp.From)
-
-				// check completion
-				if len(tr.Received) >= tr.TotalChunks {
-					// close and finalize (rename .tmp -> final)
-					tr.File.Close()
-					finalPath := filepath.Join("uploads", fmt.Sprintf("%s_%s", fileID, tr.Filename))
-					if err := os.Rename(tr.FilePath, finalPath); err != nil {
-						fmt.Println("Error renaming final file:", err)
-					} else {
-						fmt.Printf("File complete: %s from %s\n", finalPath, rp.From.String())
-					}
-					// send completion ack
-					comp := PacketHeader{Type: "ACK_COMPLETE", FileID: fileID}
-					s.sendHeaderTo(comp, rp.From)
-					delete(transfers, fileID)
+				// send ACK with file_id
+				ack := map[string]any{
+					"type":    "ack",
+					"file_id": fileID,
+					"seq":     hdr.Seq,
+					"status":  "ok",
+				}
+				ackB, _ := json.Marshal(ack)
+				if _, err := s.conn.WriteToUDP(ackB, cmd.addr); err != nil {
+					fmt.Println("Error sending ack:", err)
 				}
 
-			default:
-				// ignore or log
-				fmt.Println("Unknown packet type:", rp.Header.Type)
+			} else {
+				// normal chunk
+				fileID := hdr.FileID
+				if fileID == "" {
+					fmt.Println("Chunk without file_id from", sender)
+					nak := map[string]any{"type": "nak", "reason": "no_file_id", "seq": hdr.Seq}
+					nb, _ := json.Marshal(nak)
+					_, _ = s.conn.WriteToUDP(nb, cmd.addr)
+					continue
+				}
+				fr, ok := files[fileID]
+				if !ok {
+					// unknown file id
+					fmt.Println("Unknown file_id", fileID, "from", sender)
+					nak := map[string]any{"type": "nak", "reason": "unknown_file_id", "seq": hdr.Seq}
+					nb, _ := json.Marshal(nak)
+					_, _ = s.conn.WriteToUDP(nb, cmd.addr)
+					continue
+				}
+				// check owner matches
+				if fr.ownerAddr != sender {
+					fmt.Println("Owner mismatch for file", fileID, "from", sender, "expected", fr.ownerAddr)
+					nak := map[string]any{"type": "nak", "reason": "owner_mismatch", "seq": hdr.Seq}
+					nb, _ := json.Marshal(nak)
+					_, _ = s.conn.WriteToUDP(nb, cmd.addr)
+					continue
+				}
+
+				// if already received, ack again
+				if fr.received[hdr.Seq] {
+					ack := map[string]any{"type": "ack", "file_id": fileID, "seq": hdr.Seq, "status": "ok"}
+					ackB, _ := json.Marshal(ack)
+					_, _ = s.conn.WriteToUDP(ackB, cmd.addr)
+					continue
+				}
+
+				offset := int64(hdr.Seq) * int64(fr.chunkSize)
+				if _, err := fr.file.WriteAt(payload, offset); err != nil {
+					fmt.Println("WriteAt error:", err)
+				} else {
+					fr.received[hdr.Seq] = true
+					fr.lastActivity = time.Now()
+					fmt.Printf("Wrote chunk for file %s seq=%d size=%d\n", fileID, hdr.Seq, len(payload))
+				}
+
+				ack := map[string]any{
+					"type":    "ack",
+					"file_id": fileID,
+					"seq":     hdr.Seq,
+					"status":  "ok",
+				}
+				ackB, _ := json.Marshal(ack)
+				if _, err := s.conn.WriteToUDP(ackB, cmd.addr); err != nil {
+					fmt.Println("Error sending ack:", err)
+				}
+
+				// check for completion (if totalSize known)
+				if fr.totalSize > 0 && fr.chunkSize > 0 {
+					expected := int((fr.totalSize + int64(fr.chunkSize) - 1) / int64(fr.chunkSize))
+					if len(fr.received) >= expected {
+						// close file and report complete
+						_ = fr.file.Close()
+						fmt.Printf("File %s complete -> %s\n", fileID, fr.filePath)
+						// optionally remove from map to free memory
+						delete(files, fileID)
+					}
+				}
 			}
 		}
 	}
 }
 
-// helper to send header as JSON only
-func (s *Server) sendHeaderTo(h PacketHeader, to *net.UDPAddr) {
-	b, _ := json.Marshal(h)
-	// send JSON only (no payload)
-	_, err := s.conn.WriteToUDP(b, to)
-	if err != nil {
-		fmt.Println("Error sending header to", to.String(), ":", err)
-	}
+func sanitize(name string) string {
+	return strings.ReplaceAll(name, "/", "_")
 }
 
-// Send message (unchanged interface)
+// SendMessage unchanged API
 func (s *Server) SendMessage(target string, msg any) error {
 	errCh := make(chan error)
 	s.commands <- &command{
@@ -292,17 +322,14 @@ func (s *Server) SendMessage(target string, msg any) error {
 	return <-errCh
 }
 
-// List clients
 func (s *Server) ListClients() ([]string, error) {
 	replyCh := make(chan any)
 	errCh := make(chan error)
-
 	s.commands <- &command{
 		typ:     listClients,
 		replyCh: replyCh,
 		errCh:   errCh,
 	}
-
 	select {
 	case data := <-replyCh:
 		return data.([]string), nil
@@ -311,18 +338,15 @@ func (s *Server) ListClients() ([]string, error) {
 	}
 }
 
-// Get client
 func (s *Server) GetClient(addr string) (*net.UDPAddr, error) {
 	replyCh := make(chan any)
 	errCh := make(chan error)
-
 	s.commands <- &command{
 		typ:       getClient,
 		targetKey: addr,
 		replyCh:   replyCh,
 		errCh:     errCh,
 	}
-
 	select {
 	case data := <-replyCh:
 		return data.(*net.UDPAddr), nil
@@ -331,7 +355,6 @@ func (s *Server) GetClient(addr string) (*net.UDPAddr, error) {
 	}
 }
 
-// Add client
 func (s *Server) AddClient(addr *net.UDPAddr) error {
 	errCh := make(chan error)
 	s.commands <- &command{
@@ -342,14 +365,43 @@ func (s *Server) AddClient(addr *net.UDPAddr) error {
 	return <-errCh
 }
 
-// Handle console input (unchanged except small message)
+func (s *Server) handlePackets() {
+	buffer := make([]byte, 70000)
+	for {
+		n, clientAddr, err := s.conn.ReadFromUDP(buffer)
+		if err != nil {
+			fmt.Println("Error reading:", err)
+			continue
+		}
+		// register
+		if err := s.AddClient(clientAddr); err != nil {
+			fmt.Println("Error adding client:", err)
+		}
+
+		if n > 0 && buffer[0] == '{' {
+			// chunk packet
+			raw := make([]byte, n)
+			copy(raw, buffer[:n])
+			s.commands <- &command{
+				typ:     processChunk,
+				addr:    clientAddr,
+				rawData: raw,
+				n:       n,
+			}
+			continue
+		}
+
+		msg := strings.TrimSpace(string(buffer[:n]))
+		fmt.Printf("Message from %s: %s\n", clientAddr.String(), msg)
+	}
+}
+
 func (s *Server) handleInput() {
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufioNewReader(os.Stdin)
 	for {
 		fmt.Print("Server input> ")
 		line, _ := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
-
 		if strings.HasPrefix(line, "send ") {
 			parts := strings.SplitN(line, " ", 3)
 			if len(parts) < 3 {
@@ -372,61 +424,9 @@ func (s *Server) handleInput() {
 	}
 }
 
-// Handle incoming packets: parse header JSON (up to first '\n') then payload
-func (s *Server) handlePackets() {
-	buffer := make([]byte, 65536) // large enough for UDP packet
-	for {
-		n, clientAddr, err := s.conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading:", err)
-			continue
-		}
-
-		// Register client (async via commands)
-		if err := s.AddClient(clientAddr); err != nil {
-			fmt.Println("Error adding client:", err)
-		}
-
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-
-		// split header/payload at first '\n'
-		headerEnd := -1
-		for i := 0; i < len(data); i++ {
-			if data[i] == '\n' {
-				headerEnd = i
-				break
-			}
-		}
-
-		var hdr PacketHeader
-		var payload []byte
-
-		if headerEnd == -1 {
-			// assume whole packet is header JSON (ACKs, etc)
-			if err := json.Unmarshal(data, &hdr); err != nil {
-				fmt.Println("Invalid header-only packet from", clientAddr.String(), "err:", err)
-				continue
-			}
-		} else {
-			if err := json.Unmarshal(data[:headerEnd], &hdr); err != nil {
-				fmt.Println("Invalid header from", clientAddr.String(), "err:", err)
-				continue
-			}
-			payload = data[headerEnd+1:]
-		}
-
-		rp := &ReceivedPacket{
-			From:   clientAddr,
-			Header: hdr,
-			Data:   payload,
-		}
-		// hand over to manager for handling (no mutex anywhere)
-		s.commands <- &command{
-			typ:     recvPacket,
-			message: rp,
-		}
-	}
+// small helper (we avoid importing bufio at top to keep imports grouped — add it)
+func bufioNewReader(r *os.File) *bufio.Reader {
+	return bufio.NewReader(r)
 }
 
 func main() {
@@ -434,9 +434,9 @@ func main() {
 	if err := server.Start(); err != nil {
 		fmt.Println("Server error:", err)
 	}
+	select {}
 }
 
-//------------------------------------------
 // package main
 
 // import (

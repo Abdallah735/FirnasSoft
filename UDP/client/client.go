@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,21 +12,9 @@ import (
 	"time"
 )
 
-type PacketHeader struct {
-	Type        string `json:"type"` // INIT, CHUNK, ACK_INIT, ACK_CHUNK, ACK_COMPLETE
-	Filename    string `json:"filename,omitempty"`
-	Filesize    int64  `json:"filesize,omitempty"`
-	ChunkSeq    int    `json:"seq,omitempty"`
-	ChunkSize   int    `json:"chunk_size,omitempty"`
-	FileID      string `json:"file_id,omitempty"`
-	TotalChunks int    `json:"total_chunks,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-}
-
 type UDPClient struct {
 	serverAddr *net.UDPAddr
-	conn       *net.UDPConn
-	ackCh      chan PacketHeader // channel to receive ACK-like headers
+	conn       *net.UDPConn // main connection (for chat)
 }
 
 func NewUDPClient(server string) (*UDPClient, error) {
@@ -35,203 +22,302 @@ func NewUDPClient(server string) (*UDPClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error resolving server address: %v", err)
 	}
-
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		return nil, fmt.Errorf("error dialing server: %v", err)
 	}
-
-	c := &UDPClient{
-		serverAddr: addr,
-		conn:       conn,
-		ackCh:      make(chan PacketHeader, 100),
-	}
-
-	// reader goroutine (routes ACK_* messages to ackCh, others print)
-	go c.readerLoop()
-
-	return c, nil
+	return &UDPClient{serverAddr: addr, conn: conn}, nil
 }
 
-func (c *UDPClient) readerLoop() {
-	buffer := make([]byte, 65536)
-	for {
-		n, _, err := c.conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading from server:", err)
-			time.Sleep(time.Second)
-			continue
-		}
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-
-		// try parse header-only JSON
-		var hdr PacketHeader
-		if err := json.Unmarshal(data, &hdr); err == nil {
-			// route ACKs to ackCh
-			if strings.HasPrefix(hdr.Type, "ACK") {
-				select {
-				case c.ackCh <- hdr:
-				default:
-					// if channel full, drop to avoid blocking
-				}
-				continue
-			}
-			// otherwise print general messages
-			fmt.Println("\n[Server JSON]:", string(data))
-			fmt.Print(">> ")
-			continue
-		}
-
-		// if not JSON, print raw
-		fmt.Println("\n[Server]:", string(data))
-		fmt.Print(">> ")
-	}
+// ackRouter types
+type ackReg struct {
+	seq int
+	ch  chan struct{}
+}
+type ackMsg struct {
+	fileID string
+	seq    int
 }
 
-// helper: send header + optional payload (header JSON + '\n' + payload)
-func (c *UDPClient) sendPacketWithPayload(h PacketHeader, payload []byte) error {
-	hb, _ := json.Marshal(h)
-	if payload == nil {
-		_, err := c.conn.Write(hb)
-		return err
-	}
-	packet := make([]byte, 0, len(hb)+1+len(payload))
-	packet = append(packet, hb...)
-	packet = append(packet, '\n')
-	packet = append(packet, payload...)
-	_, err := c.conn.Write(packet)
-	return err
-}
+// SendFile: sequential send of meta (wait for ack), then parallel sending of rest using worker pool
+func (c *UDPClient) SendFile(path string) error {
+	const chunkSize = 65000
+	const ackTimeout = 5 * time.Second
+	const maxRetries = 6
+	poolSize := 6 // tune this (عدد الجو روتين العاملة)
 
-// SendFile implements send with INIT and chunk retry logic
-func (c *UDPClient) SendFile(path string, chunkSize int, timeout time.Duration, maxRetries int) error {
+	// open file
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open file: %v", err)
+		return err
 	}
 	defer f.Close()
 
-	stat, err := f.Stat()
+	fi, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("stat file: %v", err)
+		return err
 	}
-	filesize := stat.Size()
-	totalChunks := int(math.Ceil(float64(filesize) / float64(chunkSize)))
-	filename := filepath.Base(path)
-
-	// 1) send INIT
-	initHdr := PacketHeader{
-		Type:        "INIT",
-		Filename:    filename,
-		Filesize:    filesize,
-		ChunkSize:   chunkSize,
-		TotalChunks: totalChunks,
-	}
-	if err := c.sendPacketWithPayload(initHdr, nil); err != nil {
-		return fmt.Errorf("send INIT: %v", err)
+	totalSize := fi.Size()
+	numChunks := int((totalSize + int64(chunkSize) - 1) / int64(chunkSize))
+	if numChunks == 0 {
+		return fmt.Errorf("empty file")
 	}
 
-	// wait for ACK_INIT
-	var fileID string
-WAIT_INIT_ACK:
-	for {
-		select {
-		case ack := <-c.ackCh:
-			if ack.Type == "ACK_INIT" && ack.FileID != "" {
-				fileID = ack.FileID
-				break WAIT_INIT_ACK
-			} else if ack.Type == "ACK_INIT" && ack.FileID == "" {
-				return fmt.Errorf("server rejected INIT: %s", ack.Reason)
+	// create a dedicated UDP connection for this transfer (all chunks must come from the same local port)
+	localConn, err := net.DialUDP("udp", nil, c.serverAddr)
+	if err != nil {
+		return err
+	}
+	defer localConn.Close()
+
+	// --- send first chunk (metadata) and wait for ack to get file_id ---
+	// read first chunk payload
+	firstSize := chunkSize
+	if int64(firstSize) > totalSize {
+		firstSize = int(totalSize)
+	}
+	firstBuf := make([]byte, firstSize)
+	_, _ = f.ReadAt(firstBuf, 0)
+
+	metaHeader := map[string]any{
+		"first":      true,
+		"seq":        0,
+		"chunk_size": chunkSize,
+		"total_size": totalSize,
+		"file_name":  filepath.Base(path),
+	}
+	hb, _ := json.Marshal(metaHeader)
+	metaPacket := append(hb, '\n')
+	metaPacket = append(metaPacket, firstBuf...)
+
+	if _, err := localConn.Write(metaPacket); err != nil {
+		return fmt.Errorf("error sending metadata: %v", err)
+	}
+
+	// wait for ack (blocking read for meta)
+	metaBuf := make([]byte, 2048)
+	_ = localConn.SetReadDeadline(time.Now().Add(ackTimeout))
+	n, _, err := localConn.ReadFromUDP(metaBuf)
+	if err != nil {
+		return fmt.Errorf("no ack for metadata: %v", err)
+	}
+	var metaAck struct {
+		Type   string `json:"type"`
+		FileID string `json:"file_id"`
+		Seq    int    `json:"seq"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(metaBuf[:n], &metaAck); err != nil {
+		return fmt.Errorf("invalid ack for metadata: %v", err)
+	}
+	if metaAck.Type != "ack" || metaAck.FileID == "" {
+		return fmt.Errorf("metadata not acknowledged properly: %s", string(metaBuf[:n]))
+	}
+	fileID := metaAck.FileID
+	fmt.Println("Got file_id:", fileID)
+
+	// --- start ack reader + router ---
+	regCh := make(chan ackReg)
+	incomingCh := make(chan ackMsg)
+
+	// reader: reads incoming JSON ACKs and forwards to incomingCh
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, _, err := localConn.ReadFromUDP(buf)
+			if err != nil {
+				// when localConn is closed, this will error and goroutine stops
+				close(incomingCh)
+				return
 			}
-			// ignore other ACKs
-		case <-time.After(timeout):
-			// retry INIT
-			fmt.Println("No ACK_INIT, retrying INIT...")
-			if err := c.sendPacketWithPayload(initHdr, nil); err != nil {
-				return fmt.Errorf("send INIT retry: %v", err)
+			var m map[string]any
+			if err := json.Unmarshal(buf[:n], &m); err != nil {
+				continue
 			}
+			t, _ := m["type"].(string)
+			if t != "ack" {
+				continue
+			}
+			seqf, ok := m["seq"].(float64)
+			if !ok {
+				continue
+			}
+			fid, _ := m["file_id"].(string)
+			incomingCh <- ackMsg{fileID: fid, seq: int(seqf)}
 		}
-	}
-	fmt.Println("Received fileID:", fileID)
+	}()
 
-	// 2) send chunks sequentially with ack & retries
-	buf := make([]byte, chunkSize)
-	for seq := 0; seq < totalChunks; seq++ {
-		off := int64(seq) * int64(chunkSize)
-		n, err := f.ReadAt(buf, off)
-		if err != nil && n == 0 {
-			// EOF or error with no bytes
-			return fmt.Errorf("read chunk %d: %v", seq, err)
-		}
-		chunkData := make([]byte, n)
-		copy(chunkData, buf[:n])
-
-		chdr := PacketHeader{
-			Type:      "CHUNK",
-			FileID:    fileID,
-			ChunkSeq:  seq,
-			ChunkSize: chunkSize,
-		}
-
-		retries := 0
-	SEND_CHUNK:
-		if err := c.sendPacketWithPayload(chdr, chunkData); err != nil {
-			return fmt.Errorf("send chunk %d: %v", seq, err)
-		}
-
-		// wait for ACK_CHUNK
-	ACK_WAIT:
+	// router: single goroutine that keeps a map[seq]chan and dispatches incoming acks
+	go func() {
+		waiters := make(map[int]chan struct{})
 		for {
 			select {
-			case ack := <-c.ackCh:
-				if ack.Type == "ACK_CHUNK" && ack.FileID == fileID && ack.ChunkSeq == seq {
-					// chunk confirmed
-					//fmt.Printf("ACK chunk %d\n", seq)
-					break ACK_WAIT
-				} else if ack.Type == "ACK_CHUNK" && ack.FileID == fileID && ack.ChunkSeq == seq && ack.Reason != "" {
-					// server reported issue
-					return fmt.Errorf("server NAK chunk %d: %s", seq, ack.Reason)
-				} else if ack.Type == "ACK_COMPLETE" && ack.FileID == fileID {
-					// server says complete early
-					fmt.Println("Server reported complete for file:", fileID)
-					return nil
+			case reg, ok := <-regCh:
+				if !ok {
+					// cleanup and exit
+					for _, ch := range waiters {
+						close(ch)
+					}
+					return
 				}
-				// else ignore and keep waiting
-			case <-time.After(timeout):
-				retries++
-				if retries > maxRetries {
-					return fmt.Errorf("chunk %d: no ack after %d retries", seq, retries-1)
+				// register/overwrite
+				waiters[reg.seq] = reg.ch
+			case im, ok := <-incomingCh:
+				if !ok {
+					// incoming closed -> exit
+					for _, ch := range waiters {
+						close(ch)
+					}
+					return
 				}
-				fmt.Printf("Timeout waiting ACK for chunk %d, retry %d/%d\n", seq, retries, maxRetries)
-				goto SEND_CHUNK
+				// dispatch if waiter exists
+				if ch, found := waiters[im.seq]; found {
+					// notify and remove
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+					delete(waiters, im.seq)
+				}
 			}
+		}
+	}()
+
+	// --- worker pool to send chunks in parallel ---
+	type task struct {
+		seq int
+	}
+	tasks := make(chan task, numChunks)
+	doneCh := make(chan int, numChunks)
+	errCh := make(chan error, 1)
+
+	// worker logic: register, send, wait for ack (with retries)
+	for w := 0; w < poolSize; w++ {
+		go func(workerID int) {
+			for t := range tasks {
+				seq := t.seq
+				off := int64(seq) * int64(chunkSize)
+				readSize := chunkSize
+				if off+int64(readSize) > totalSize {
+					readSize = int(totalSize - off)
+				}
+				buf := make([]byte, readSize)
+				_, err := f.ReadAt(buf, off)
+				if err != nil {
+					// read error -> report and stop
+					select {
+					case errCh <- fmt.Errorf("read error seq %d: %v", seq, err):
+					default:
+					}
+					return
+				}
+
+				// attempt with retries
+				retries := 0
+				for {
+					ackWait := make(chan struct{}, 1)
+					// register waiter
+					regCh <- ackReg{seq: seq, ch: ackWait}
+
+					// build header
+					h := map[string]any{
+						"first":      false,
+						"seq":        seq,
+						"chunk_size": chunkSize,
+						"file_id":    fileID,
+					}
+					hj, _ := json.Marshal(h)
+					pkt := append(hj, '\n')
+					pkt = append(pkt, buf...)
+
+					// write (concurrent writes are OK)
+					if _, err := localConn.Write(pkt); err != nil {
+						// immediate write error
+						retries++
+						if retries > maxRetries {
+							select {
+							case errCh <- fmt.Errorf("write failed seq %d: %v", seq, err):
+							default:
+							}
+							return
+						}
+						time.Sleep(500 * time.Millisecond)
+						continue
+					}
+
+					// wait ack or timeout
+					select {
+					case <-ackWait:
+						// success
+						doneCh <- seq
+						goto nextTask
+					case <-time.After(ackTimeout):
+						retries++
+						if retries > maxRetries {
+							select {
+							case errCh <- fmt.Errorf("no ack for seq %d after %d retries", seq, maxRetries):
+							default:
+							}
+							return
+						}
+						// retry (loop)
+						// re-register on next iteration
+					}
+				}
+			nextTask:
+				continue
+			}
+		}(w)
+	}
+
+	// enqueue tasks for seq 1..numChunks-1 because seq 0 already sent with meta
+	for seq := 1; seq < numChunks; seq++ {
+		tasks <- task{seq: seq}
+	}
+	close(tasks)
+
+	// wait for completions
+	expected := numChunks - 1 // since seq 0 done
+	received := 0
+	for received < expected {
+		select {
+		case <-doneCh:
+			received++
+			// optionally print progress
+			if received%10 == 0 || received == expected {
+				fmt.Printf("Progress: %d/%d chunks acknowledged\n", received, expected)
+			}
+		case e := <-errCh:
+			// fatal error
+			localConn.Close()
+			return e
 		}
 	}
 
-	// optionally wait for ACK_COMPLETE
-	waitCompleteTimer := time.NewTimer(5 * time.Second)
-	defer waitCompleteTimer.Stop()
-	for {
-		select {
-		case ack := <-c.ackCh:
-			if ack.Type == "ACK_COMPLETE" && ack.FileID == fileID {
-				fmt.Println("File transfer complete!")
-				return nil
-			}
-		case <-waitCompleteTimer.C:
-			fmt.Println("No ACK_COMPLETE received, assuming done.")
-			return nil
-		}
-	}
+	// all done
+	fmt.Println("File transfer complete")
+	// close router by closing regCh and localConn (reader goroutine will exit)
+	close(regCh)
+	localConn.Close()
+	return nil
 }
 
-// Start interactive client
 func (c *UDPClient) Start() {
 	fmt.Println("UDP client started. Connected to", c.serverAddr.String())
 	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
-	fmt.Println("To send file: sendfile <path> [chunkSize]")
-	// keepalive ticker
+	go func() {
+		buffer := make([]byte, 2048)
+		for {
+			n, _, err := c.conn.ReadFromUDP(buffer)
+			if err != nil {
+				fmt.Println("Error reading from server:", err)
+				continue
+			}
+			fmt.Println("\n[Server]:", string(buffer[:n]))
+			fmt.Print(">> ")
+		}
+	}()
+
 	go func() {
 		ticker := time.NewTicker(28 * time.Second)
 		defer ticker.Stop()
@@ -248,28 +334,21 @@ func (c *UDPClient) Start() {
 		fmt.Print(">> ")
 		text, _ := reader.ReadString('\n')
 		text = strings.TrimSpace(text)
-
 		if text == "exit" {
 			fmt.Println("Client exiting...")
 			break
 		}
 		if strings.HasPrefix(text, "sendfile ") {
-			parts := strings.SplitN(text, " ", 3)
-			path := strings.TrimSpace(parts[1])
-			chunkSize := 65000 // default ~65KB
-			if len(parts) == 3 {
-				// try parse chunk size
-				fmt.Sscanf(parts[2], "%d", &chunkSize)
+			parts := strings.SplitN(text, " ", 2)
+			if len(parts) < 2 {
+				fmt.Println("Usage: sendfile <path>")
+				continue
 			}
-			fmt.Println("Sending file:", path, "chunkSize:", chunkSize)
-			if err := c.SendFile(path, chunkSize, 5*time.Second, 5); err != nil {
+			if err := c.SendFile(strings.TrimSpace(parts[1])); err != nil {
 				fmt.Println("SendFile error:", err)
-			} else {
-				fmt.Println("SendFile finished.")
 			}
 			continue
 		}
-
 		_, err := c.conn.Write([]byte(text))
 		if err != nil {
 			fmt.Println("Error writing to server:", err)
@@ -278,17 +357,15 @@ func (c *UDPClient) Start() {
 }
 
 func main() {
-	client, err := NewUDPClient("173.208.144.109:10000") // replace with server ip if needed
+	client, err := NewUDPClient("173.208.144.109:10000")
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 	defer client.conn.Close()
-
 	client.Start()
 }
 
-//------------------------------------------
 // package main
 
 // import (
