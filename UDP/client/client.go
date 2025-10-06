@@ -268,7 +268,6 @@ func GeneratePacket(p *Packet) ([]byte, error) {
 	if err := enc.Encode(p); err != nil {
 		return nil, err
 	}
-	// Enc/Dec Information (مستقبلي: هنا ممكن نضيف encryption)
 	return buf.Bytes(), nil
 }
 

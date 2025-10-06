@@ -471,17 +471,6 @@ func GeneratePacket(p *Packet) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-/*
-func decodePacket(data []byte) (*Packet, error) {
-	p := &Packet{}
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(p); err != nil {
-		return nil, err
-	}
-	return p, nil
-}
-*/
-
 func computeChecksum(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
 }
