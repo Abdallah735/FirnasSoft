@@ -1,73 +1,320 @@
-// UDP server
 package main
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/gob"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"hash/crc32"
-	"math"
-	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-type commandType int
+type PacketType string
 
 const (
-	addClient commandType = iota
-	sendMessage
-	listClients
-	getClient
-	sendFile
-	processACK
-	completeTransfer
+	Message      PacketType = "message"
+	Ping         PacketType = "ping"
+	Pong         PacketType = "pong"
+	FileMetadata PacketType = "file_metadata"
+	FileChunk    PacketType = "file_chunk"
+	Ack          PacketType = "ack"
 )
 
-type command struct {
-	typ       commandType
-	addr      *net.UDPAddr
-	targetKey string
-	message   any
-	replyCh   chan any
-	errCh     chan error
+const (
+	chunkSize       = 32 * 1024 // Keep 32KB for safety; change to 60*1024 if needed.
+	numWorkers      = 5
+	resendInterval  = 2 * time.Second // Shorter for faster retry.
+	maxAttempts     = 10              // More attempts for reliability.
+	timeoutDuration = 60 * time.Second
+	onlineThreshold = 30 * time.Second
+	sendPace        = 1 * time.Millisecond // Pace sends to avoid burst loss.
+)
+
+type IncomingPacket struct {
+	addr *net.UDPAddr
+	data []byte
 }
 
+type Pending struct {
+	data     []byte
+	addr     *net.UDPAddr
+	sendTime time.Time
+	attempts int
+}
+
+type Client struct {
+	addr     *net.UDPAddr
+	lastSeen time.Time
+}
+
+// ----------------- Communication Manager -----------------
+type CommunicationManager struct {
+	conn     *net.UDPConn
+	incoming chan IncomingPacket
+}
+
+func NewCommunicationManager(conn *net.UDPConn) *CommunicationManager {
+	return &CommunicationManager{
+		conn:     conn,
+		incoming: make(chan IncomingPacket, 100),
+	}
+}
+
+func (cm *CommunicationManager) StartListen() {
+	go func() {
+		buffer := make([]byte, 65536)
+		for {
+			n, addr, err := cm.conn.ReadFromUDP(buffer)
+			if err != nil {
+				fmt.Println("Error reading:", err)
+				continue
+			}
+			dataCopy := make([]byte, n)
+			copy(dataCopy, buffer[:n])
+			cm.incoming <- IncomingPacket{addr, dataCopy}
+		}
+	}()
+}
+
+func (cm *CommunicationManager) Send(addr *net.UDPAddr, data []byte) error {
+	_, err := cm.conn.WriteToUDP(data, addr)
+	return err
+}
+
+// ----------------- Client Manager -----------------
+type ClientManager struct {
+	clients map[string]*Client
+	mutex   sync.Mutex
+}
+
+func NewClientManager() *ClientManager {
+	return &ClientManager{
+		clients: make(map[string]*Client),
+	}
+}
+
+func (cm *ClientManager) UpdateClient(addr *net.UDPAddr) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	key := addr.String()
+	if c, ok := cm.clients[key]; ok {
+		c.lastSeen = time.Now()
+	} else {
+		cm.clients[key] = &Client{addr: addr, lastSeen: time.Now()}
+	}
+}
+
+func (cm *ClientManager) GetClient(key string) (*net.UDPAddr, error) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	if c, ok := cm.clients[key]; ok {
+		return c.addr, nil
+	}
+	return nil, fmt.Errorf("client not found: %s", key)
+}
+
+func (cm *ClientManager) IsOnline(key string) bool {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	if c, ok := cm.clients[key]; ok {
+		return time.Since(c.lastSeen) < onlineThreshold
+	}
+	return false
+}
+
+func (cm *ClientManager) ListClients() []string {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	list := make([]string, 0, len(cm.clients))
+	for k := range cm.clients {
+		list = append(list, k)
+	}
+	return list
+}
+
+// ----------------- Packet Tracker -----------------
+type PacketTracker struct {
+	pending        map[string]*Pending
+	mutex          sync.Mutex
+	resendInterval time.Duration
+	maxAttempts    int
+	timeout        time.Duration
+	comm           *CommunicationManager
+}
+
+func NewPacketTracker(comm *CommunicationManager) *PacketTracker {
+	return &PacketTracker{
+		pending:        make(map[string]*Pending),
+		resendInterval: resendInterval,
+		maxAttempts:    maxAttempts,
+		timeout:        timeoutDuration,
+		comm:           comm,
+	}
+}
+
+func (pt *PacketTracker) Start() {
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			now := time.Now()
+			pt.mutex.Lock()
+			for key, p := range pt.pending {
+				if p.attempts >= pt.maxAttempts || now.Sub(p.sendTime) > pt.timeout {
+					fmt.Printf("Failed to deliver packet %s after %d attempts\n", key, p.attempts)
+					delete(pt.pending, key)
+					continue
+				}
+				if now.Sub(p.sendTime) > pt.resendInterval {
+					err := pt.comm.Send(p.addr, p.data)
+					if err != nil {
+						fmt.Println("Error resending packet:", err)
+					} else {
+						p.sendTime = now
+						p.attempts++
+						fmt.Printf("Resending packet %s (attempt %d)\n", key, p.attempts)
+					}
+				}
+			}
+			pt.mutex.Unlock()
+		}
+	}()
+}
+
+func (pt *PacketTracker) AddPending(fileID string, chunkIndex int, data []byte, addr *net.UDPAddr) {
+	key := fmt.Sprintf("%s_%d", fileID, chunkIndex)
+	pt.mutex.Lock()
+	pt.pending[key] = &Pending{data: data, addr: addr, sendTime: time.Now(), attempts: 1}
+	pt.mutex.Unlock()
+}
+
+func (pt *PacketTracker) RemovePending(fileID string, chunkIndex int) {
+	key := fmt.Sprintf("%s_%d", fileID, chunkIndex)
+	pt.mutex.Lock()
+	delete(pt.pending, key)
+	pt.mutex.Unlock()
+}
+
+func (pt *PacketTracker) HasPending(fileID string, chunkIndex int) bool {
+	key := fmt.Sprintf("%s_%d", fileID, chunkIndex)
+	pt.mutex.Lock()
+	defer pt.mutex.Unlock()
+	_, ok := pt.pending[key]
+	return ok
+}
+
+// ----------------- Packet Manager -----------------
+type PacketManager struct {
+	tracker *PacketTracker
+}
+
+func NewPacketManager(comm *CommunicationManager) *PacketManager {
+	pm := &PacketManager{
+		tracker: NewPacketTracker(comm),
+	}
+	pm.tracker.Start()
+	return pm
+}
+
+func (pm *PacketManager) Generate(pt PacketType, payload map[string]interface{}) []byte {
+	m := map[string]interface{}{"type": string(pt)}
+	for k, v := range payload {
+		if k == "data" {
+			switch t := v.(type) {
+			case []byte:
+				m[k] = base64.StdEncoding.EncodeToString(t)
+			case string:
+				m[k] = t
+			default:
+				jsonData, err := json.Marshal(v)
+				if err == nil {
+					m[k] = string(jsonData)
+				}
+			}
+			continue
+		}
+		m[k] = v
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return []byte{}
+	}
+	return data
+}
+
+func (pm *PacketManager) Parse(data []byte) (map[string]interface{}, error) {
+	m := make(map[string]interface{})
+	err := json.Unmarshal(data, &m)
+	if err != nil {
+		return nil, fmt.Errorf("json unmarshal error: %v", err)
+	}
+	if _, ok := m["type"]; !ok {
+		return nil, fmt.Errorf("missing type")
+	}
+	if d, ok := m["data"]; ok {
+		if ds, ok := d.(string); ok {
+			if pt, ok := m["type"].(string); ok && pt == "file_chunk" {
+				b, err := base64.StdEncoding.DecodeString(ds)
+				if err != nil {
+					return nil, fmt.Errorf("base64 decode error: %v", err)
+				}
+				m["data"] = b
+			}
+		}
+	}
+	return m, nil
+}
+
+func (pm *PacketManager) Handle(s *Server, addr *net.UDPAddr, parsed map[string]interface{}) {
+	ptStr, ok := parsed["type"].(string)
+	if !ok {
+		return
+	}
+	pt := PacketType(ptStr)
+	switch pt {
+	case Ping:
+		fmt.Printf("Received PING from %s\n", addr.String())
+		pong := pm.Generate(Pong, nil)
+		if err := s.comm.Send(addr, pong); err != nil {
+			fmt.Println("Error sending PONG:", err)
+		} else {
+			fmt.Printf("Sent PONG to %s\n", addr.String())
+		}
+	case Message:
+		data, ok := parsed["data"].(string)
+		if ok {
+			fmt.Printf("Message from %s: %s\n", addr.String(), data)
+		}
+	case Ack:
+		fileID, ok1 := parsed["file_id"].(string)
+		chunkIndexF, ok2 := parsed["chunk_index"].(float64)
+		if ok1 && ok2 {
+			chunkIndex := int(chunkIndexF)
+			pm.tracker.RemovePending(fileID, chunkIndex)
+		}
+	default:
+		fmt.Printf("Unknown packet type from %s: %s\n", addr.String(), pt)
+	}
+}
+
+// ----------------- Server Struct -----------------
 type Server struct {
-	addr             string
-	conn             *net.UDPConn
-	commands         chan *command
-	BindingMap       map[string]*net.UDPAddr
-	PendingMap       map[uint32]*PendingEntry
-	ServerLevelQueue chan QueueItem
-}
-
-type PendingEntry struct {
-	SourceData []byte
-	ChunkID    uint32
-	Offset     uint64
-	Retries    int
-	Timer      *time.Timer
-	ClientAddr *net.UDPAddr
-}
-
-type QueueItem struct {
-	Data       []byte
-	ClientAddr *net.UDPAddr
+	addr   string
+	comm   *CommunicationManager
+	client *ClientManager
+	packet *PacketManager
+	conn   *net.UDPConn
 }
 
 func NewServer(addr string) *Server {
 	return &Server{
-		addr:             addr,
-		commands:         make(chan *command),
-		BindingMap:       make(map[string]*net.UDPAddr),
-		PendingMap:       make(map[uint32]*PendingEntry),
-		ServerLevelQueue: make(chan QueueItem, 100),
+		addr:   addr,
+		client: NewClientManager(),
 	}
 }
 
@@ -82,224 +329,122 @@ func (s *Server) Start() error {
 		return fmt.Errorf("error listening: %v", err)
 	}
 
+	s.comm = NewCommunicationManager(s.conn)
+	s.packet = NewPacketManager(s.comm)
+
 	fmt.Println("UDP server listening on", s.addr)
 
-	go s.clientManagerWorker()
-	go s.handleInput()
-	go s.readWorker()
+	s.comm.StartListen()
 
-	for w := 0; w < 4; w++ {
-		go s.writeWorker()
-	}
+	go s.processIncoming()
+
+	go s.handleInput()
 
 	return nil
 }
 
-func (s *Server) clientManagerWorker() {
-	var fileIDCounter uint32 = 0
+func (s *Server) processIncoming() {
 	for {
-		cmd := <-s.commands
-
-		switch cmd.typ {
-		case addClient:
-			s.BindingMap[cmd.addr.String()] = cmd.addr
-			cmd.errCh <- nil
-
-		case sendMessage:
-			if clientAddr, ok := s.BindingMap[cmd.targetKey]; ok {
-				msg := cmd.message
-				p := &Packet{
-					Type:     TYPE_MESSAGE,
-					Data:     []byte(fmt.Sprintf("[Server] %v", msg)),
-					Checksum: computeChecksum([]byte(fmt.Sprintf("[Server] %v", msg))),
-				}
-				data, err := GeneratePacket(p)
-				if err != nil {
-					cmd.errCh <- err
-					continue
-				}
-				s.ServerLevelQueue <- QueueItem{Data: data, ClientAddr: clientAddr}
-				cmd.errCh <- nil
-			} else {
-				cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
-			}
-
-		case listClients:
-			list := make([]string, 0, len(s.BindingMap))
-			for k := range s.BindingMap {
-				list = append(list, k)
-			}
-			cmd.replyCh <- list
-
-		case getClient:
-			if clientAddr, ok := s.BindingMap[cmd.targetKey]; ok {
-				cmd.replyCh <- clientAddr
-			} else {
-				cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
-			}
-
-		case sendFile:
-			if clientAddr, ok := s.BindingMap[cmd.targetKey]; ok {
-				path := cmd.message.(string)
-				fileID := fileIDCounter
-				fileIDCounter++
-				data, err := os.ReadFile(path)
-				if err != nil {
-					cmd.errCh <- err
-					continue
-				}
-				fileChecksum := computeChecksum(data)
-				fileSize := len(data)
-				fileName := filepath.Base(path)
-				numChunks := int(math.Ceil(float64(fileSize) / float64(CHUNK_SIZE)))
-				for i := 0; i < numChunks; i++ {
-					start := i * CHUNK_SIZE
-					end := start + CHUNK_SIZE
-					if end > fileSize {
-						end = fileSize
-					}
-					chunkData := data[start:end]
-					entry := &PendingEntry{
-						SourceData: chunkData,
-						ChunkID:    uint32(i),
-						Offset:     uint64(start),
-						Retries:    0,
-						ClientAddr: clientAddr,
-					}
-					s.PendingMap[fileID*100+uint32(i)] = entry
-					if i == 0 {
-						p := &Packet{
-							Type:         TYPE_FILE_META,
-							FileID:       fileID,
-							ChunkID:      uint32(i),
-							Offset:       uint64(start),
-							Data:         chunkData,
-							Checksum:     computeChecksum(chunkData),
-							FileSize:     uint64(fileSize),
-							FileName:     fileName,
-							TotalChunks:  uint32(numChunks),
-							FileChecksum: fileChecksum,
-						}
-						data, err := GeneratePacket(p)
-						if err != nil {
-							cmd.errCh <- err
-							continue
-						}
-						s.ServerLevelQueue <- QueueItem{Data: data, ClientAddr: clientAddr}
-						entry.Timer = time.AfterFunc(ACK_TIMEOUT, func() {
-							s.commands <- &command{typ: processACK, targetKey: fmt.Sprintf("%d", fileID), message: ackInfo{chunkID: 0, ok: false}}
-						})
-					} else {
-						p := &Packet{
-							Type:     TYPE_FILE_CHUNK,
-							FileID:   fileID,
-							ChunkID:  uint32(i),
-							Offset:   uint64(start),
-							Data:     chunkData,
-							Checksum: computeChecksum(chunkData),
-						}
-						data, err := GeneratePacket(p)
-						if err != nil {
-							cmd.errCh <- err
-							continue
-						}
-						s.ServerLevelQueue <- QueueItem{Data: data, ClientAddr: clientAddr}
-						entry.Timer = time.AfterFunc(ACK_TIMEOUT, func() {
-							s.commands <- &command{typ: processACK, targetKey: fmt.Sprintf("%d", fileID), message: ackInfo{chunkID: uint32(i), ok: false}}
-						})
-					}
-				}
-				cmd.errCh <- nil
-			} else {
-				cmd.errCh <- fmt.Errorf("client not found: %s", cmd.targetKey)
-			}
-
-		case processACK:
-			fileIDStr := cmd.targetKey
-			fileID64, _ := strconv.ParseUint(fileIDStr, 10, 32)
-			fileID := uint32(fileID64)
-			ai := cmd.message.(ackInfo)
-			if entry, ok := s.PendingMap[fileID*100+ai.chunkID]; ok {
-				if ai.ok {
-					if entry.Timer != nil {
-						entry.Timer.Stop()
-					}
-					delete(s.PendingMap, fileID*100+ai.chunkID)
-					if ai.chunkID == 0 && len(s.PendingMap) == 0 {
-						for i := 1; i < int(fileIDCounter)*100; i++ {
-							if entry, ok := s.PendingMap[uint32(i)]; ok {
-								var pType int
-								if entry.ChunkID == 0 {
-									pType = TYPE_FILE_META
-								} else {
-									pType = TYPE_FILE_CHUNK
-								}
-								p := &Packet{
-									Type:     pType,
-									FileID:   fileID,
-									ChunkID:  entry.ChunkID,
-									Offset:   entry.Offset,
-									Data:     entry.SourceData,
-									Checksum: computeChecksum(entry.SourceData),
-								}
-								data, err := GeneratePacket(p)
-								if err != nil {
-									continue
-								}
-								s.ServerLevelQueue <- QueueItem{Data: data, ClientAddr: entry.ClientAddr} // استخدام ClientAddr من PendingEntry
-								entry.Timer = time.AfterFunc(ACK_TIMEOUT, func() {
-									s.commands <- &command{typ: processACK, targetKey: fmt.Sprintf("%d", fileID), message: ackInfo{chunkID: entry.ChunkID, ok: false}}
-								})
-							}
-						}
-					}
-				} else {
-					if entry.Retries < MAX_RETRIES {
-						entry.Retries++
-						var pType int
-						if entry.ChunkID == 0 {
-							pType = TYPE_FILE_META
-						} else {
-							pType = TYPE_FILE_CHUNK
-						}
-						p := &Packet{
-							Type:     pType,
-							FileID:   fileID,
-							ChunkID:  entry.ChunkID,
-							Offset:   entry.Offset,
-							Data:     entry.SourceData,
-							Checksum: computeChecksum(entry.SourceData),
-						}
-						data, err := GeneratePacket(p)
-						if err != nil {
-							continue
-						}
-						s.ServerLevelQueue <- QueueItem{Data: data, ClientAddr: entry.ClientAddr} // استخدام ClientAddr من PendingEntry
-						if entry.Timer != nil {
-							entry.Timer.Reset(ACK_TIMEOUT)
-						} else {
-							entry.Timer = time.AfterFunc(ACK_TIMEOUT, func() {
-								s.commands <- &command{typ: processACK, targetKey: fmt.Sprintf("%d", fileID), message: ackInfo{chunkID: entry.ChunkID, ok: false}}
-							})
-						}
-					} else {
-						if entry.Timer != nil {
-							entry.Timer.Stop()
-						}
-						delete(s.PendingMap, fileID*100+ai.chunkID)
-					}
-				}
-			}
-
-		case completeTransfer:
-			fileIDStr := cmd.targetKey
-			fileID64, _ := strconv.ParseUint(fileIDStr, 10, 32)
-			fileID := uint32(fileID64)
-			for i := 0; i < 1000; i++ {
-				delete(s.PendingMap, fileID*100+uint32(i))
-			}
+		inc := <-s.comm.incoming
+		s.client.UpdateClient(inc.addr)
+		parsed, err := s.packet.Parse(inc.data)
+		if err != nil {
+			fmt.Printf("Parse error from %s (len %d): %v\n", inc.addr.String(), len(inc.data), err) // Added logging for debug.
+			continue
 		}
+		s.packet.Handle(s, inc.addr, parsed)
 	}
+}
+
+func (s *Server) SendMessage(target string, msg string) error {
+	addr, err := s.client.GetClient(target)
+	if err != nil {
+		return err
+	}
+	payload := map[string]interface{}{"data": msg}
+	packet := s.packet.Generate(Message, payload)
+	return s.comm.Send(addr, packet)
+}
+
+func splitFileData(data []byte, size int) [][]byte {
+	var chunks [][]byte
+	for i := 0; i < len(data); i += size {
+		end := i + size
+		if end > len(data) {
+			end = len(data)
+		}
+		chunks = append(chunks, data[i:end])
+	}
+	return chunks
+}
+
+func (s *Server) SendFile(target string, filePath string) error {
+	addr, err := s.client.GetClient(target)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	fileSize := int64(len(data))
+	chunks := splitFileData(data, chunkSize)
+	fileID := uuid.New().String()
+	fileName := filepath.Base(filePath)
+	metaPayload := map[string]interface{}{
+		"file_id":      fileID,
+		"total_chunks": len(chunks),
+		"file_size":    fileSize,
+		"file_name":    fileName,
+	}
+	metaPacket := s.packet.Generate(FileMetadata, metaPayload)
+	if err := s.comm.Send(addr, metaPacket); err != nil {
+		return err
+	}
+	s.packet.tracker.AddPending(fileID, -1, metaPacket, addr)
+
+	// Wait for metadata ack with timeout.
+	start := time.Now()
+	for time.Since(start) < timeoutDuration {
+		if !s.packet.tracker.HasPending(fileID, -1) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if s.packet.tracker.HasPending(fileID, -1) {
+		return fmt.Errorf("timeout waiting for metadata ack")
+	}
+
+	// Launch workers for parallel chunk sending with pacing.
+	chunkCh := make(chan int, len(chunks))
+	for i := 0; i < len(chunks); i++ {
+		chunkCh <- i
+	}
+	close(chunkCh)
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			defer wg.Done()
+			for idx := range chunkCh {
+				chunkPayload := map[string]interface{}{
+					"file_id":     fileID,
+					"chunk_index": idx,
+					"data":        chunks[idx],
+				}
+				packet := s.packet.Generate(FileChunk, chunkPayload)
+				if err := s.comm.Send(addr, packet); err != nil {
+					fmt.Printf("Error sending chunk %d: %v\n", idx, err)
+				} else {
+					time.Sleep(sendPace) // Pace to reduce loss.
+				}
+				s.packet.tracker.AddPending(fileID, idx, packet, addr)
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
 }
 
 func (s *Server) handleInput() {
@@ -308,210 +453,51 @@ func (s *Server) handleInput() {
 		fmt.Print("Server input> ")
 		line, _ := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
-
-		if strings.HasPrefix(line, "send ") {
-			parts := strings.SplitN(line, " ", 3)
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) == 0 {
+			continue
+		}
+		switch parts[0] {
+		case "send":
 			if len(parts) < 3 {
 				fmt.Println("Usage: send <clientAddr> <message>")
 				continue
 			}
-			errCh := make(chan error)
-			s.commands <- &command{
-				typ:       sendMessage,
-				targetKey: parts[1],
-				message:   parts[2],
-				errCh:     errCh,
-			}
-			if err := <-errCh; err != nil {
+			if err := s.SendMessage(parts[1], "[Server] "+parts[2]); err != nil {
 				fmt.Println("Error:", err)
 			}
-		} else if strings.HasPrefix(line, "sendfile ") {
-			parts := strings.SplitN(line, " ", 3)
+		case "sendfile":
 			if len(parts) < 3 {
 				fmt.Println("Usage: sendfile <clientAddr> <filePath>")
 				continue
 			}
-			errCh := make(chan error)
-			s.commands <- &command{
-				typ:       sendFile,
-				targetKey: parts[1],
-				message:   parts[2],
-				errCh:     errCh,
-			}
-			if err := <-errCh; err != nil {
+			if err := s.SendFile(parts[1], parts[2]); err != nil {
 				fmt.Println("Error:", err)
+			} else {
+				fmt.Println("File send initiated")
 			}
-		} else if line == "list" {
-			replyCh := make(chan any)
-			errCh := make(chan error)
-			s.commands <- &command{typ: listClients, replyCh: replyCh, errCh: errCh}
-			select {
-			case data := <-replyCh:
-				for _, c := range data.([]string) {
-					fmt.Println("Client:", c)
-				}
-			case err := <-errCh:
-				fmt.Println("Error:", err)
+		case "list":
+			clients := s.client.ListClients()
+			for _, c := range clients {
+				fmt.Println("Client:", c)
 			}
-		}
-	}
-}
-
-func (s *Server) readWorker() {
-	buffer := make([]byte, 65536)
-	for {
-		n, clientAddr, err := s.conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading:", err)
-			continue
-		}
-		if err := s.AddClient(clientAddr); err != nil {
-			fmt.Println("Error adding client:", err)
-		}
-		p, err := s.ParsePacket(buffer[:n])
-		if err != nil {
-			fmt.Println("Error parsing packet:", err)
-			continue
-		}
-		switch p.Type {
-		case TYPE_MESSAGE:
-			msg := strings.TrimSpace(string(p.Data))
-			if msg == "PING" {
-				data, err := GeneratePacket(&Packet{Type: TYPE_MESSAGE, Data: []byte("PONG"), Checksum: computeChecksum([]byte("PONG"))})
-				if err != nil {
-					fmt.Println("Error encoding PONG:", err)
-					continue
-				}
-				s.ServerLevelQueue <- QueueItem{Data: data, ClientAddr: clientAddr}
+		case "isonline":
+			if len(parts) < 2 {
+				fmt.Println("Usage: isonline <clientAddr>")
+				continue
 			}
-			fmt.Printf("Message from %s: %s\n", clientAddr.String(), msg)
-		case TYPE_ACK:
-			ai := ackInfo{chunkID: p.ChunkID, ok: p.AckStatus}
-			s.commands <- &command{typ: processACK, targetKey: fmt.Sprintf("%d", p.FileID), message: ai}
+			online := s.client.IsOnline(parts[1])
+			fmt.Printf("%s is online: %t\n", parts[1], online)
 		}
 	}
-}
-
-func (s *Server) writeWorker() {
-	for item := range s.ServerLevelQueue {
-		_, err := s.conn.WriteToUDP(item.Data, item.ClientAddr)
-		if err != nil {
-			fmt.Println("Error writing:", err)
-		}
-	}
-}
-
-func (s *Server) ParsePacket(data []byte) (*Packet, error) {
-	p := &Packet{}
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(p); err != nil {
-		return nil, err
-	}
-	return p, nil
-}
-
-func (s *Server) SendMessage(target string, msg any) error {
-	errCh := make(chan error)
-	s.commands <- &command{
-		typ:       sendMessage,
-		targetKey: target,
-		message:   msg,
-		errCh:     errCh,
-	}
-	return <-errCh
-}
-
-func (s *Server) SendFile(target string, path string) error {
-	errCh := make(chan error)
-	s.commands <- &command{
-		typ:       sendFile,
-		targetKey: target,
-		message:   path,
-		errCh:     errCh,
-	}
-	return <-errCh
-}
-
-func (s *Server) ListClients() ([]string, error) {
-	replyCh := make(chan any)
-	errCh := make(chan error)
-	s.commands <- &command{typ: listClients, replyCh: replyCh, errCh: errCh}
-	select {
-	case data := <-replyCh:
-		return data.([]string), nil
-	case err := <-errCh:
-		return nil, err
-	}
-}
-
-func (s *Server) GetClient(addr string) (*net.UDPAddr, error) {
-	replyCh := make(chan any)
-	errCh := make(chan error)
-	s.commands <- &command{typ: getClient, targetKey: addr, replyCh: replyCh, errCh: errCh}
-	select {
-	case data := <-replyCh:
-		return data.(*net.UDPAddr), nil
-	case err := <-errCh:
-		return nil, err
-	}
-}
-
-func (s *Server) AddClient(addr *net.UDPAddr) error {
-	errCh := make(chan error)
-	s.commands <- &command{typ: addClient, addr: addr, errCh: errCh}
-	return <-errCh
-}
-
-func GeneratePacket(p *Packet) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(p); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func computeChecksum(data []byte) uint32 {
-	return crc32.ChecksumIEEE(data)
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	server := NewServer(":10000")
 	if err := server.Start(); err != nil {
 		fmt.Println("Server error:", err)
 	}
 	select {}
-}
-
-const (
-	CHUNK_SIZE  = 60000
-	ACK_TIMEOUT = 5 * time.Second
-	MAX_RETRIES = 3
-
-	TYPE_MESSAGE    = 0
-	TYPE_FILE_META  = 1
-	TYPE_FILE_CHUNK = 2
-	TYPE_ACK        = 3
-)
-
-type Packet struct {
-	Type         int
-	FileID       uint32
-	ChunkID      uint32
-	Offset       uint64
-	Data         []byte
-	Checksum     uint32
-	FileSize     uint64
-	FileName     string
-	TotalChunks  uint32
-	FileChecksum uint32
-	AckStatus    bool
-}
-
-type ackInfo struct {
-	chunkID uint32
-	ok      bool
 }
 
 // package main
