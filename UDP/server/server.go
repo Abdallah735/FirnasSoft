@@ -33,7 +33,7 @@ const (
 	maxAttempts     = 10              // More attempts for reliability.
 	timeoutDuration = 60 * time.Second
 	onlineThreshold = 30 * time.Second
-	sendPace        = 1 * time.Millisecond // Pace sends to avoid burst loss.
+	sendPace        = 40 * time.Millisecond // Pace sends to avoid burst loss.
 )
 
 type IncomingPacket struct {
@@ -140,7 +140,7 @@ func (cm *ClientManager) ListClients() []string {
 
 // ----------------- Packet Tracker -----------------
 type PacketTracker struct {
-	pending        map[string]*Pending
+	pending        map[string]*Pending //????????????????????????
 	mutex          sync.Mutex
 	resendInterval time.Duration
 	maxAttempts    int
