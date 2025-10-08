@@ -1,3 +1,5 @@
+// === client.go ===
+// ضع هذا المحتوى في ملف مستقل باسم client.go
 package main
 
 import (
@@ -21,10 +23,6 @@ const (
 	FileChunk    PacketType = "file_chunk"
 	Ack          PacketType = "ack"
 )
-
-// const (
-// 	chunkSize = 32 * 1024 // For consistency with server, though not used in client for splitting.
-// )
 
 type FileReceiver struct {
 	fileName    string
@@ -111,12 +109,14 @@ func (c *UDPClient) sendAck(fileID string, chunkIndex int) {
 	ackPacket := generate(Ack, ackPayload)
 	_, err := c.conn.Write(ackPacket)
 	if err != nil {
-		fmt.Println("Error sending ack:", err)
+		fmt.Println(time.Now().Format(time.RFC3339Nano), "Error sending ack:", err)
+	} else {
+		fmt.Println(time.Now().Format(time.RFC3339Nano), "[CLIENT] Sent ACK", fileID, chunkIndex)
 	}
 }
 
 func (c *UDPClient) Start() {
-	fmt.Println("UDP client started. Connected to", c.serverAddr.String())
+	fmt.Println(time.Now().Format(time.RFC3339Nano), "UDP client started. Connected to", c.serverAddr.String())
 	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
 
 	go func() {
@@ -124,14 +124,14 @@ func (c *UDPClient) Start() {
 		for {
 			n, _, err := c.conn.ReadFromUDP(buffer)
 			if err != nil {
-				fmt.Println("Error reading from server:", err)
+				fmt.Println(time.Now().Format(time.RFC3339Nano), "Error reading from server:", err)
 				continue
 			}
 			dataCopy := make([]byte, n)
 			copy(dataCopy, buffer[:n])
 			parsed, err := parse(dataCopy)
 			if err != nil {
-				fmt.Printf("Parse error (len %d): %v\n", n, err) // Added logging for debug.
+				fmt.Printf("%s Parse error (len %d): %v\n", time.Now().Format(time.RFC3339Nano), n, err)
 				continue
 			}
 			ptStr, ok := parsed["type"].(string)
@@ -141,7 +141,7 @@ func (c *UDPClient) Start() {
 			pt := PacketType(ptStr)
 			switch pt {
 			case Pong:
-				fmt.Println("[Server]: PONG received")
+				fmt.Println(time.Now().Format(time.RFC3339Nano), "[Server]: PONG received")
 			case Message:
 				data, ok := parsed["data"].(string)
 				if ok {
@@ -165,7 +165,8 @@ func (c *UDPClient) Start() {
 							chunks:      make(map[int][]byte),
 						}
 					}
-					// Always ack, even on duplicate.
+					fmt.Printf("%s [CLIENT] Received METADATA file=%s name=%s total=%d size=%d\n", time.Now().Format(time.RFC3339Nano), fileID, name, total, size)
+					// Always ack metadata
 					c.sendAck(fileID, -1)
 				}
 			case FileChunk:
@@ -176,30 +177,29 @@ func (c *UDPClient) Start() {
 					idx := int(idxF)
 					r, ok := c.receivers[fileID]
 					if ok {
-						// Set only if new; always ack.
 						if _, has := r.chunks[idx]; !has {
 							r.chunks[idx] = data
 						}
 						c.sendAck(fileID, idx)
-						// Check len(chunks) instead of counter.
+						fmt.Printf("%s [CLIENT] Stored chunk %d/%d for file %s (stored=%d)\n", time.Now().Format(time.RFC3339Nano), idx, r.totalChunks, r.fileName, len(r.chunks))
 						if len(r.chunks) == r.totalChunks {
 							var fullData []byte
 							for i := 0; i < r.totalChunks; i++ {
 								chunk, ok := r.chunks[i]
 								if !ok {
-									fmt.Printf("Missing chunk %d for %s\n", i, r.fileName)
+									fmt.Printf("%s Missing chunk %d for %s\n", time.Now().Format(time.RFC3339Nano), i, r.fileName)
 									break
 								}
 								fullData = append(fullData, chunk...)
 							}
 							if int64(len(fullData)) != r.fileSize {
-								fmt.Printf("File size mismatch for %s (got %d, expected %d)\n", r.fileName, len(fullData), r.fileSize)
+								fmt.Printf("%s File size mismatch for %s (got %d, expected %d)\n", time.Now().Format(time.RFC3339Nano), r.fileName, len(fullData), r.fileSize)
 							} else {
 								err := os.WriteFile(r.fileName, fullData, 0644)
 								if err != nil {
-									fmt.Println("Error saving file:", err)
+									fmt.Println(time.Now().Format(time.RFC3339Nano), "Error saving file:", err)
 								} else {
-									fmt.Println("File received and saved:", r.fileName)
+									fmt.Println(time.Now().Format(time.RFC3339Nano), "File received and saved:", r.fileName)
 								}
 							}
 							delete(c.receivers, fileID)
@@ -217,9 +217,9 @@ func (c *UDPClient) Start() {
 			pingPacket := generate(Ping, nil)
 			_, err := c.conn.Write(pingPacket)
 			if err != nil {
-				fmt.Println("Error sending PING:", err)
+				fmt.Println(time.Now().Format(time.RFC3339Nano), "Error sending PING:", err)
 			} else {
-				fmt.Println("Sent PING to server")
+				fmt.Println(time.Now().Format(time.RFC3339Nano), "Sent PING to server")
 			}
 		}
 	}()
@@ -239,13 +239,13 @@ func (c *UDPClient) Start() {
 		packet := generate(Message, payload)
 		_, err := c.conn.Write(packet)
 		if err != nil {
-			fmt.Println("Error writing to server:", err)
+			fmt.Println(time.Now().Format(time.RFC3339Nano), "Error writing to server:", err)
 		}
 	}
 }
 
 func main() {
-	client, err := NewUDPClient("173.208.144.109:10000") //173.208.144.109  //127.0.0.1
+	client, err := NewUDPClient("173.208.144.109:10000")
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
