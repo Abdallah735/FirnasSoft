@@ -30,7 +30,7 @@ const (
 )
 
 const (
-	chunkSize       = 11 * 1024 // 32KB
+	chunkSize       = 10 * 1024 // 32KB
 	numWorkers      = 6
 	resendInterval  = 2 * time.Second
 	maxAttempts     = 10

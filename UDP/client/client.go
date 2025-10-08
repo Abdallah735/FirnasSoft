@@ -1,5 +1,4 @@
 // === client.go ===
-// ضع هذا المحتوى في ملف مستقل باسم client.go
 package main
 
 import (
@@ -245,7 +244,7 @@ func (c *UDPClient) Start() {
 }
 
 func main() {
-	client, err := NewUDPClient("127.0.0.1:10000")
+	client, err := NewUDPClient("173.208.144.109:10000")
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
