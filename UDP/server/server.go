@@ -1,5 +1,4 @@
 // === server.go ===
-// ضع هذا المحتوى في ملف مستقل باسم server.go
 package main
 
 import (
@@ -31,8 +30,8 @@ const (
 )
 
 const (
-	chunkSize       = 32 * 1024 // 32KB
-	numWorkers      = 6         // عدد الوركرز الدائمين (standby)
+	chunkSize       = 11 * 1024 // 32KB
+	numWorkers      = 6
 	resendInterval  = 2 * time.Second
 	maxAttempts     = 10
 	timeoutDuration = 60 * time.Second
