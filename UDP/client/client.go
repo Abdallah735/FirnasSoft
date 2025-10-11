@@ -628,7 +628,7 @@ func (c *UDPClient) SendFile(filePath string) error {
 }
 
 func main() {
-	client, err := NewUDPClient("127.0.0.1:10000") // عدّل العنوان حسب السيرفر
+	client, err := NewUDPClient("173.208.144.109") // عدّل العنوان حسب السيرفر
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
