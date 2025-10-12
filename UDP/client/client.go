@@ -56,22 +56,25 @@ type PendingPacketsJob struct {
 }
 
 type Client struct {
-	id             string
-	serverAddr     *net.UDPAddr
-	conn           *net.UDPConn
-	writeQueue     chan Job
-	parseQueue     chan Job
-	genQueue       chan GenTask
-	pendingPackets map[uint16]PendingPacketsJob
-
-	muxPending chan Mutex
-	snapshot   atomic.Value
-
+	id               string
+	serverAddr       *net.UDPAddr
+	conn             *net.UDPConn
+	writeQueue       chan Job
+	parseQueue       chan Job
+	genQueue         chan GenTask
+	pendingPackets   map[uint16]PendingPacketsJob
+	muxPending       chan Mutex
+	snapshot         atomic.Value
+	pendingSendTimes map[uint16]time.Time
+	chunkSize        int
+	muChunkSize      sync.Mutex
+	lastRTT          time.Duration
+	lastBandwidth    float64
+	lossRate         float64
 	// file receiving
 	mux           sync.Mutex
 	fileName      string
 	totalChunks   int
-	chunkSize     int
 	receivedCount int
 	fileHandle    *os.File
 }
@@ -88,17 +91,22 @@ func NewClient(id string, server string) *Client {
 	}
 
 	c := &Client{
-		id:             id,
-		serverAddr:     addr,
-		conn:           conn,
-		writeQueue:     make(chan Job, 5000),
-		parseQueue:     make(chan Job, 5000),
-		genQueue:       make(chan GenTask, 5000),
-		pendingPackets: make(map[uint16]PendingPacketsJob),
-		muxPending:     make(chan Mutex, 5000),
+		id:               id,
+		serverAddr:       addr,
+		conn:             conn,
+		writeQueue:       make(chan Job, 5000),
+		parseQueue:       make(chan Job, 5000),
+		genQueue:         make(chan GenTask, 5000),
+		pendingPackets:   make(map[uint16]PendingPacketsJob),
+		muxPending:       make(chan Mutex, 5000),
+		snapshot:         atomic.Value{},
+		pendingSendTimes: make(map[uint16]time.Time),
+		chunkSize:        1200,
+		lastRTT:          100 * time.Millisecond,
+		lastBandwidth:    1000000,
+		lossRate:         0.0,
 	}
 	c.snapshot.Store(make(map[uint16]PendingPacketsJob))
-
 	return c
 }
 
@@ -138,7 +146,6 @@ func (c *Client) fieldPacketTrackingWorker() {
 
 		for packetID, pending := range pendings {
 			if now.Sub(pending.LastSend) >= 1*time.Second {
-				// fmt.Printf("Retransmitting packet %d\n", packetID)
 				c.writeQueue <- pending.Job
 				c.muxPending <- Mutex{Action: "updatePending", PacketID: packetID}
 			}
@@ -179,7 +186,7 @@ func (c *Client) packetGeneratorWorker() {
 		if task.MsgType != _ack {
 			binary.BigEndian.PutUint16(packet[0:2], packetID)
 			c.muxPending <- Mutex{Action: "addPending", PacketID: packetID, Packet: packet}
-			// ack notifier
+			c.pendingSendTimes[packetID] = time.Now()
 			if task.AckChan != nil {
 				go func(pid uint16, ackCh chan struct{}) {
 					for {
@@ -196,7 +203,6 @@ func (c *Client) packetGeneratorWorker() {
 				task.RespChan <- packetID
 			}
 		} else {
-			// for ack or metadata/ack-like, use given client ack id
 			binary.BigEndian.PutUint16(packet[0:2], task.ClientAckPacketId)
 		}
 
@@ -215,13 +221,19 @@ func (c *Client) PacketParser(packet []byte) {
 
 	switch msgType {
 	case _message:
-		// reply ack to server
 		c.packetGenerator(_ack, []byte("message received"), packetID, nil, nil)
 		fmt.Println("Server:", string(payload))
 
 	case _ack:
-		// remove pending
 		fmt.Println("Server ack:", string(payload))
+		sendTime, ok := c.pendingSendTimes[packetID]
+		if ok {
+			rtt := time.Since(sendTime)
+			c.muChunkSize.Lock()
+			c.lastRTT = rtt
+			c.muChunkSize.Unlock()
+			delete(c.pendingSendTimes, packetID)
+		}
 		c.muxPending <- Mutex{Action: "deletePending", PacketID: packetID}
 
 	case _metadata:
@@ -247,7 +259,6 @@ func (c *Client) SendMessage(message string) {
 }
 
 func (c *Client) handleMetadata(payload []byte, clientAckPacketId uint16) {
-	// metadata-> filename|totalChunks|chunkSize
 	meta := string(payload)
 	parts := strings.Split(meta, "|")
 	if len(parts) != 3 {
@@ -262,7 +273,6 @@ func (c *Client) handleMetadata(payload []byte, clientAckPacketId uint16) {
 	c.receivedCount = 0
 	c.mux.Unlock()
 
-	// ack metadata
 	c.packetGenerator(_ack, []byte("metadata received"), clientAckPacketId, nil, nil)
 	fmt.Printf("Metadata received: %s (%d chunks, %d bytes each)\n", c.fileName, c.totalChunks, c.chunkSize)
 
@@ -288,7 +298,6 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 	c.mux.Lock()
 	f := c.fileHandle
 	filename := c.fileName
-	chunkSize := c.chunkSize
 	c.receivedCount++
 	allDone := (c.receivedCount >= c.totalChunks)
 	c.mux.Unlock()
@@ -298,7 +307,7 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 		return
 	}
 
-	offset := int64(idx * chunkSize)
+	offset := int64(idx * c.chunkSize)
 	_, err := f.WriteAt(data, offset)
 	if err != nil {
 		fmt.Println("Error writing chunk:", err)
@@ -319,7 +328,109 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 	}
 }
 
-// SendFileToServer: send metadata then chunks (client -> server)
+func (c *Client) measureRTT() time.Duration {
+	rtts := make([]time.Duration, 0, 5)
+	count := 5
+	for i := 0; i < count; i++ {
+		respChan := make(chan uint16, 1)
+		c.packetGenerator(_ping, []byte("ping"), 0, nil, respChan)
+		packetID := <-respChan
+		start := time.Now()
+		time.Sleep(200 * time.Millisecond)
+		for j := 0; j < 10; j++ {
+			if _, exists := c.pendingSendTimes[packetID]; !exists {
+				rtts = append(rtts, time.Since(start))
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if len(rtts) == 0 {
+		return c.lastRTT
+	}
+	var sum time.Duration
+	for _, rtt := range rtts {
+		sum += rtt
+	}
+	return sum / time.Duration(len(rtts))
+}
+
+func (c *Client) measureBandwidth() float64 {
+	testSize := 1000
+	count := 10
+	start := time.Now()
+	for i := 0; i < count; i++ {
+		payload := make([]byte, testSize)
+		c.packetGenerator(_message, payload, 0, nil, nil)
+		time.Sleep(50 * time.Millisecond)
+	}
+	elapsed := time.Since(start).Seconds()
+	totalBytes := float64(testSize * count)
+	return (totalBytes * 8) / elapsed // bits/sec
+}
+
+func (c *Client) measurePathMTU() int {
+	return 1500 // Fallback to standard MTU
+}
+
+func (c *Client) measureLossRate() float64 {
+	reply := make(chan interface{})
+	c.muxPending <- Mutex{Action: "getAllPending", Reply: reply}
+	pendings := (<-reply).(map[uint16]PendingPacketsJob)
+	totalPending := len(pendings)
+	if totalPending == 0 {
+		return 0.0
+	}
+	return c.lossRate // Placeholder; improve by tracking retransmits
+}
+
+func (c *Client) networkMonitor() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		rtt := c.measureRTT()
+		bandwidth := c.measureBandwidth()
+		mtu := c.measurePathMTU()
+		loss := c.measureLossRate()
+
+		bdp := (bandwidth * rtt.Seconds()) / 8 // bytes
+		maxChunk := mtu - 28                   // IP+UDP headers
+
+		newChunkSize := int(bdp / 10)
+		if loss > 0.05 {
+			newChunkSize = int(float64(newChunkSize) * 0.8)
+		}
+		newChunkSize = min(newChunkSize, maxChunk)
+
+		c.muChunkSize.Lock()
+		c.chunkSize = max(newChunkSize, 512)
+		c.lastRTT = rtt
+		c.lastBandwidth = bandwidth
+		c.lossRate = loss
+		c.muChunkSize.Unlock()
+
+		c.conn.SetReadBuffer(int(bdp * 1.5))
+		c.conn.SetWriteBuffer(int(bdp * 1.5))
+
+		fmt.Printf("Updated: chunkSize=%d, RTT=%v, bandwidth=%.2f Mbps, loss=%.2f%%\n",
+			c.chunkSize, rtt, bandwidth/1e6, loss*100)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (c *Client) SendFileToServer(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -333,17 +444,17 @@ func (c *Client) SendFileToServer(path string) error {
 	}
 
 	fileSize := stat.Size()
-	// use same chunkSize as server: but safe size — reduce fragmentation risk
-	totalChunks := int((fileSize + int64(ChunkSize) - 1) / int64(ChunkSize))
+	c.muChunkSize.Lock()
+	chunkSz := c.chunkSize
+	c.muChunkSize.Unlock()
 
+	totalChunks := int((fileSize + int64(chunkSz) - 1) / int64(chunkSz))
 	filename := filepath.Base(path)
-	metadataStr := fmt.Sprintf("%s|%d|%d", filename, totalChunks, ChunkSize)
+	metadataStr := fmt.Sprintf("%s|%d|%d", filename, totalChunks, chunkSz)
 
 	metaAck := make(chan struct{})
-	// send metadata (do not add metadata to pending because server should just ack it once)
 	c.packetGenerator(_metadata, []byte(metadataStr), 0, metaAck, nil)
 
-	// wait ack
 	select {
 	case <-metaAck:
 		fmt.Println("Metadata ack received, starting file transfer")
@@ -351,7 +462,7 @@ func (c *Client) SendFileToServer(path string) error {
 		return fmt.Errorf("timeout waiting metadata ack")
 	}
 
-	buf := make([]byte, ChunkSize)
+	buf := make([]byte, chunkSz)
 	for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
 		n, err := io.ReadFull(f, buf)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
@@ -365,7 +476,6 @@ func (c *Client) SendFileToServer(path string) error {
 		copy(payload[4:], chunkData)
 
 		c.packetGenerator(_chunk, payload, 0, nil, nil)
-		// optionally throttle a little
 		time.Sleep(30 * time.Millisecond)
 	}
 	return nil
@@ -375,23 +485,20 @@ func (c *Client) Start() {
 	for i := 1; i <= 4; i++ {
 		go c.writeWorker(i)
 	}
-
 	for i := 1; i <= 4; i++ {
 		go c.packetGeneratorWorker()
 	}
-
 	go c.readWorker()
-
 	for i := 1; i <= 4; i++ {
 		go c.packetParserWorker()
 	}
-
 	go c.MutexHandleActions()
 	go c.fieldPacketTrackingWorker()
+	go c.networkMonitor()
 }
 
 func main() {
-	client := NewClient("2", "173.208.144.109:10000")
+	client := NewClient("2", "127.0.0.1:10000")
 	client.Start()
 
 	client.Register()
@@ -442,11 +549,6 @@ func (c *Client) MutexHandleActions() {
 			c.updatePendingSnapshot()
 
 		case "getAllPending":
-			// copy := make(map[uint16]models.PendingPacketsJob)
-			// for k, v := range c.pendingPackets {
-			// 	copy[k] = v
-			// }
-			// mu.Reply <- copy
 			snap := c.snapshot.Load()
 			if snap == nil {
 				mu.Reply <- make(map[uint16]PendingPacketsJob)
@@ -458,7 +560,6 @@ func (c *Client) MutexHandleActions() {
 }
 
 func (c *Client) updatePendingSnapshot() {
-	// create new map and store it atomically
 	cp := make(map[uint16]PendingPacketsJob, len(c.pendingPackets))
 	for k, v := range c.pendingPackets {
 		cp[k] = v

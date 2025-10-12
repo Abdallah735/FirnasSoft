@@ -1,0 +1,6 @@
+ssh samir@173.208.144.109
+Samir@18239_$
+
+admin Account:-
+ssh administrator@173.208.144.109
+Firna$@7_%
