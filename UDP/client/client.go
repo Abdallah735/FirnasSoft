@@ -403,7 +403,7 @@ func (c *Client) networkMonitor() {
 		newChunkSize = min(newChunkSize, maxChunk)
 
 		c.muChunkSize.Lock()
-		c.chunkSize = max(newChunkSize, 512)
+		c.chunkSize = max(newChunkSize, 1024)
 		c.lastRTT = rtt
 		c.lastBandwidth = bandwidth
 		c.lossRate = loss
