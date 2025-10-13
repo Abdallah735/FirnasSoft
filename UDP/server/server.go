@@ -538,7 +538,7 @@ func (s *Server) Start() {
 	go s.MutexHandleActions()
 	go s.MutexHandleClientActions()
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 1; i++ {
 		go s.udpWriteWorker(i)
 		go s.pktGWorker()
 		go s.packetSender()

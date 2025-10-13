@@ -483,17 +483,17 @@ func (c *Client) updatePendingSnapshot() {
 }
 
 func (c *Client) Start() {
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= 1; i++ {
 		go c.writeWorker(i)
 	}
 
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= 1; i++ {
 		go c.packetGeneratorWorker()
 	}
 
 	go c.readWorker()
 
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= 1; i++ {
 		go c.packetParserWorker()
 	}
 
