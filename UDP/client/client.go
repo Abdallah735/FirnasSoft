@@ -72,11 +72,12 @@ type Client struct {
 	lastBandwidth    float64
 	lossRate         float64
 	// file receiving
-	mux           sync.Mutex
-	fileName      string
-	totalChunks   int
-	receivedCount int
-	fileHandle    *os.File
+	mux                sync.Mutex
+	pendingSendTimesMu sync.Mutex
+	fileName           string
+	totalChunks        int
+	receivedCount      int
+	fileHandle         *os.File
 }
 
 func NewClient(id string, server string) *Client {
@@ -186,12 +187,20 @@ func (c *Client) packetGeneratorWorker() {
 		if task.MsgType != _ack {
 			binary.BigEndian.PutUint16(packet[0:2], packetID)
 			c.muxPending <- Mutex{Action: "addPending", PacketID: packetID, Packet: packet}
+			c.pendingSendTimesMu.Lock()
 			c.pendingSendTimes[packetID] = time.Now()
+			c.pendingSendTimesMu.Unlock()
 			if task.AckChan != nil {
 				go func(pid uint16, ackCh chan struct{}) {
 					for {
-						_, ok := c.pendingPackets[pid]
-						if !ok {
+						snap := c.snapshot.Load()
+						if snap == nil {
+							// no pending
+							close(ackCh)
+							return
+						}
+						pendingMap := snap.(map[uint16]PendingPacketsJob)
+						if _, ok := pendingMap[pid]; !ok {
 							close(ackCh)
 							return
 						}
@@ -226,6 +235,7 @@ func (c *Client) PacketParser(packet []byte) {
 
 	case _ack:
 		fmt.Println("Server ack:", string(payload))
+		c.pendingSendTimesMu.Lock()
 		sendTime, ok := c.pendingSendTimes[packetID]
 		if ok {
 			rtt := time.Since(sendTime)
@@ -234,6 +244,8 @@ func (c *Client) PacketParser(packet []byte) {
 			c.muChunkSize.Unlock()
 			delete(c.pendingSendTimes, packetID)
 		}
+		c.pendingSendTimesMu.Unlock()
+
 		c.muxPending <- Mutex{Action: "deletePending", PacketID: packetID}
 
 	case _metadata:
@@ -385,7 +397,7 @@ func (c *Client) measureLossRate() float64 {
 }
 
 func (c *Client) networkMonitor() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		rtt := c.measureRTT()
@@ -498,7 +510,7 @@ func (c *Client) Start() {
 }
 
 func main() {
-	client := NewClient("2", "127.0.0.1:10000")
+	client := NewClient("2", "173.208.144.109:10000")
 	client.Start()
 
 	client.Register()
