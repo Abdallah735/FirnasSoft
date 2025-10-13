@@ -5,8 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-
-	// "math/rand"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -25,7 +24,7 @@ const (
 	Metadata = 5
 	Chunk    = 6
 	//total - (pktID + encDec + msgtype + chunkIndex)
-	ChunkSize = 10000 //65507 - (2 + 2 + 1 + 4) // 65507 - 9 = 65498    //32768
+	ChunkSize = 65507 - (2 + 2 + 1 + 4) // 65507 - 9 = 65498    //32768
 )
 
 type Job struct {
@@ -82,13 +81,10 @@ type Server struct {
 	metaPendingMap map[uint16]chan struct{}
 
 	snapshot atomic.Value
-
-	packetIDCounter uint32
 	//
-	filesMu        sync.Mutex
-	files          map[string]*os.File
-	meta           map[string]FileMeta
-	receivedChunks map[string]map[int]bool
+	filesMu sync.Mutex
+	files   map[string]*os.File
+	meta    map[string]FileMeta
 }
 
 func NewServer(addr string) (*Server, error) {
@@ -115,12 +111,10 @@ func NewServer(addr string) (*Server, error) {
 		metaPendingMap: make(map[uint16]chan struct{}),
 		files:          make(map[string]*os.File),
 		meta:           make(map[string]FileMeta),
-		receivedChunks: make(map[string]map[int]bool),
 	}
 	s.snapshot.Store(make(map[uint16]PendingPacketsJob))
 	return s, nil
 }
-
 func (s *Server) udpWriteWorker(id int) {
 	for {
 		job := <-s.writeQueue
@@ -151,7 +145,6 @@ func (s *Server) packetSender() {
 		s.writeQueue <- job
 	}
 }
-
 func (s *Server) handleRegister(addr *net.UDPAddr, payload []byte, clientAckPacketId uint16) {
 	id := string(payload)
 	s.muxClient <- Mutex{Action: "registration", Addr: addr, Id: id}
@@ -192,7 +185,6 @@ func (s *Server) handleMessage(addr *net.UDPAddr, payload []byte, clientAckPacke
 	s.packetGenerator(addr, Ack, []byte("message received"), clientAckPacketId, nil)
 	fmt.Printf("Message from %s: %s\n", client.ID, string(payload))
 }
-
 func (s *Server) packetGenerator(addr *net.UDPAddr, msgType byte, payload []byte, clientAckPacketId uint16, ackChan chan struct{}) {
 	task := GenTask{Addr: addr, MsgType: msgType, Payload: payload, ClientAckPacketId: clientAckPacketId, AckChan: ackChan}
 	s.genQueue <- task
@@ -202,10 +194,8 @@ func (s *Server) pktGWorker() {
 	for {
 		task := <-s.genQueue
 		packet := make([]byte, 2+2+1+len(task.Payload))
-		// r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		// packetID := uint16(r.Intn(65535))
-		pid := atomic.AddUint32(&s.packetIDCounter, 1)
-		packetID := uint16(pid & 0xFFFF) // احذر overflow لكن monotonic يكفي لتقليل التصادمات
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		packetID := uint16(r.Intn(65535))
 
 		binary.BigEndian.PutUint16(packet[2:4], 0)
 		packet[4] = task.MsgType
@@ -271,7 +261,7 @@ func (s *Server) handleMetadata(addr *net.UDPAddr, payload []byte, clientAckPack
 
 	// prepare file for this addr
 	key := addr.String()
-	fpath := "fromClient_" + filename
+	fpath := "recv_" + filename
 
 	f, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -280,12 +270,9 @@ func (s *Server) handleMetadata(addr *net.UDPAddr, payload []byte, clientAckPack
 	}
 
 	s.filesMu.Lock()
-	if _, ok := s.files[key]; ok {
-		s.filesMu.Unlock()
-		fmt.Printf("Duplicate metadata ignored from %s\n", addr.String())
-		return
+	if old, ok := s.files[key]; ok {
+		old.Close()
 	}
-
 	s.files[key] = f
 	s.meta[key] = FileMeta{
 		Filename:    filename,
@@ -293,7 +280,6 @@ func (s *Server) handleMetadata(addr *net.UDPAddr, payload []byte, clientAckPack
 		ChunkSize:   chunkSz,
 		Received:    0,
 	}
-	s.receivedChunks[key] = make(map[int]bool)
 	s.filesMu.Unlock()
 
 	// ack metadata back to client (client is expecting it)
@@ -311,21 +297,6 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 
 	key := addr.String()
 	s.filesMu.Lock()
-
-	// check exist map
-	if _, exists := s.receivedChunks[key]; !exists {
-		s.receivedChunks[key] = make(map[int]bool)
-	}
-
-	// duplication
-	if s.receivedChunks[key][idx] {
-		s.filesMu.Unlock()
-		fmt.Printf("Duplicate chunk %d ignored from %s\n", idx, key)
-		s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d already received", idx)), clientAckPacketId, nil)
-		return
-	}
-	s.receivedChunks[key][idx] = true
-
 	f, okf := s.files[key]
 	meta, okm := s.meta[key]
 	if okm {
@@ -336,6 +307,9 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 
 	if !okf {
 		fmt.Println("No file handle for", key)
+		// still ack so sender knows it's received (or we could ignore)
+		s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d received (no file)", idx)), clientAckPacketId, nil)
+		return
 	}
 
 	offset := int64(idx * meta.ChunkSize)
@@ -352,17 +326,18 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 	// if done, close
 	if okm && meta.Received >= meta.TotalChunks {
 		s.filesMu.Lock()
-		f.Close()
-		delete(s.files, key)
+		if f2, ok := s.files[key]; ok {
+			f2.Close()
+			delete(s.files, key)
+		}
 		delete(s.meta, key)
-		delete(s.receivedChunks, key)
 		s.filesMu.Unlock()
-		fmt.Printf("File saved from %s: fromClient_%s\n", addr.String(), meta.Filename)
+		fmt.Printf("File saved from %s: recv_%s\n", addr.String(), meta.Filename)
 	}
 }
 
 func (s *Server) fieldPacketTrackingWorker() {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -374,7 +349,7 @@ func (s *Server) fieldPacketTrackingWorker() {
 
 		for packetID, pending := range pendings {
 			if now.Sub(pending.LastSend) >= 1*time.Second {
-				// fmt.Printf("Retransmitting packet %d\n", packetID)
+				fmt.Printf("Retransmitting packet %d\n", packetID)
 				s.builtpackets <- pending.Job
 				s.muxPending <- Mutex{Action: "updatePending", PacketID: packetID}
 			}
@@ -431,11 +406,10 @@ func (s *Server) SendFileToClient(client *Client, filepath string, filename stri
 		copy(payload[4:], chunkData)
 
 		s.packetGenerator(client.Addr, Chunk, payload, 0, nil)
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
 	return nil
 }
-
 func (s *Server) MutexHandleClientActions() {
 	for mu := range s.muxClient {
 		switch mu.Action {
@@ -507,7 +481,6 @@ func (s *Server) updatePendingSnapshot() {
 	}
 	s.snapshot.Store(cp)
 }
-
 func (s *Server) MessageFromServerAnyTime() {
 	for {
 		var send, id, msg string
@@ -551,7 +524,6 @@ func (s *Server) Start() {
 
 	select {}
 }
-
 func main() {
 	s, err := NewServer(":10000")
 	if err != nil {
