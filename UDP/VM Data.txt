@@ -1,6 +1,8 @@
+ssh -i ~/.ssh/id_ed25519 samir@173.208.144.109
 ssh samir@173.208.144.109
 Samir@18239_$
 
+
 admin Account:-
 ssh administrator@173.208.144.109
-Firna$@7_%
+ScDX6J2mxC11#8q

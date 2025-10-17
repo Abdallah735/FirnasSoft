@@ -1,0 +1,26 @@
+sudo adduser ali
+sudo usermod -aG sudo ali
+
+sudo mkdir -p /home/ali/.ssh
+sudo chmod 700 /home/ali/.ssh
+sudo chown ali:ali /home/ali/.ssh
+
+echo "ssh-ed25519 AAAA....rest_of_key.... user@example.com" | sudo tee /home/ali/.ssh/authorized_keys
+
+sudo chmod 600 /home/ali/.ssh/authorized_keys
+sudo chown ali:ali /home/ali/.ssh/authorized_keys
+
+sudo nano /etc/ssh/sshd_config
+
+وانزل لاخر الملف وضيف دي 
+
+Match User ali
+    PasswordAuthentication no
+    AuthenticationMethods publickey
+
+ctrl + o ---> ctrl + x
+
+sudo systemctl restart ssh
+
+جرب ssh ali@your-server-ip
+
