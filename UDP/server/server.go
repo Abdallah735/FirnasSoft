@@ -1,12 +1,10 @@
-// === server.go ===
+// === server.go (modified) ===
 package main
 
 import (
 	"encoding/binary"
 	"fmt"
 	"io"
-
-	// "math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,14 +16,17 @@ import (
 )
 
 const (
-	Register = 1
-	Ping     = 2
-	Message  = 3
-	Ack      = 4
-	Metadata = 5
-	Chunk    = 6
-	//total - (pktID + encDec + msgtype + chunkIndex)
-	ChunkSize = 1200 //10000 //65507 - (2 + 2 + 1 + 4) // 65507 - 9 = 65498    //32768
+	Register         = 1
+	Ping             = 2
+	Message          = 3
+	Ack              = 4
+	Metadata         = 5
+	Chunk            = 6
+	RequestChunk     = 7
+	PendingChunk     = 8
+	TransferComplete = 9
+
+	ChunkSize = 1200
 )
 
 type Job struct {
@@ -86,9 +87,18 @@ type Server struct {
 	packetIDCounter uint32
 	//
 	filesMu        sync.Mutex
-	files          map[string]*os.File
+	files          map[string]*os.File // incoming files from clients (receiving)
 	meta           map[string]FileMeta
 	receivedChunks map[string]map[int]bool
+
+	// files to serve (when server acts as sender)
+	serveMux   sync.Mutex
+	serveFiles map[string]*os.File
+	serveMeta  map[string]FileMeta
+
+	// waiters for received chunks per filename per client address
+	waitMux   sync.Mutex
+	waitChans map[string]map[int]chan struct{}
 }
 
 func NewServer(addr string) (*Server, error) {
@@ -116,6 +126,10 @@ func NewServer(addr string) (*Server, error) {
 		files:          make(map[string]*os.File),
 		meta:           make(map[string]FileMeta),
 		receivedChunks: make(map[string]map[int]bool),
+
+		serveFiles: make(map[string]*os.File),
+		serveMeta:  make(map[string]FileMeta),
+		waitChans:  make(map[string]map[int]chan struct{}),
 	}
 	s.snapshot.Store(make(map[uint16]PendingPacketsJob))
 	return s, nil
@@ -202,16 +216,15 @@ func (s *Server) pktGWorker() {
 	for {
 		task := <-s.genQueue
 		packet := make([]byte, 2+2+1+len(task.Payload))
-		// r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		// packetID := uint16(r.Intn(65535))
+
 		pid := atomic.AddUint32(&s.packetIDCounter, 1)
-		packetID := uint16(pid & 0xFFFF) // احذر overflow لكن monotonic يكفي لتقليل التصادمات
+		packetID := uint16(pid & 0xFFFF)
 
 		binary.BigEndian.PutUint16(packet[2:4], 0)
 		packet[4] = task.MsgType
 		copy(packet[5:], task.Payload)
 
-		if task.MsgType != Ack {
+		if task.MsgType != Ack && task.MsgType != RequestChunk && task.MsgType != PendingChunk && task.MsgType != TransferComplete {
 			binary.BigEndian.PutUint16(packet[0:2], packetID)
 			s.muxPending <- Mutex{Action: "addPending", PacketID: packetID, Addr: task.Addr, Packet: packet}
 			if task.AckChan != nil {
@@ -255,6 +268,13 @@ func (s *Server) PacketParser(addr *net.UDPAddr, packet []byte) {
 		s.handleMetadata(addr, payload, packetID)
 	case Chunk:
 		s.handleChunk(addr, payload, packetID)
+	case RequestChunk:
+		s.handleRequestChunk(addr, payload, packetID)
+	case PendingChunk:
+		// receiver told us pending; we can ignore or log
+		fmt.Println("Received pending from", addr, string(payload))
+	case TransferComplete:
+		s.handleTransferComplete(addr, payload, packetID)
 	}
 }
 
@@ -269,7 +289,7 @@ func (s *Server) handleMetadata(addr *net.UDPAddr, payload []byte, clientAckPack
 	totalChunks, _ := strconv.Atoi(parts[1])
 	chunkSz, _ := strconv.Atoi(parts[2])
 
-	// prepare file for this addr
+	// prepare file for this addr (this is incoming file from client)
 	key := addr.String()
 	fpath := "fromClient_" + filename
 
@@ -299,6 +319,9 @@ func (s *Server) handleMetadata(addr *net.UDPAddr, payload []byte, clientAckPack
 	// ack metadata back to client (client is expecting it)
 	s.packetGenerator(addr, Ack, []byte("metadata received"), clientAckPacketId, nil)
 	fmt.Printf("Metadata received from %s: %s (%d chunks, %d bytes each)\n", addr.String(), filename, totalChunks, chunkSz)
+
+	// start request manager to pull chunks from this client
+	go s.requestManagerForIncoming(addr, filename, totalChunks, chunkSz)
 }
 
 func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketId uint16) {
@@ -310,14 +333,12 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 	copy(data, payload[4:])
 
 	key := addr.String()
-	s.filesMu.Lock()
 
-	// check exist map
+	s.filesMu.Lock()
 	if _, exists := s.receivedChunks[key]; !exists {
 		s.receivedChunks[key] = make(map[int]bool)
 	}
 
-	// duplication
 	if s.receivedChunks[key][idx] {
 		s.filesMu.Unlock()
 		fmt.Printf("Duplicate chunk %d ignored from %s\n", idx, key)
@@ -345,6 +366,20 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 		return
 	}
 
+	// notify waiting channels for this client+file if any
+	name := meta.Filename
+	s.waitMux.Lock()
+	if chmap, ok := s.waitChans[name]; ok {
+		if ch, ok2 := chmap[idx]; ok2 {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	}
+	s.waitMux.Unlock()
+
 	// ack the chunk to client
 	s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d received", idx)), clientAckPacketId, nil)
 	fmt.Printf("Chunk %d received from %s (%d/%d)\n", idx, addr.String(), meta.Received, meta.TotalChunks)
@@ -358,6 +393,7 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 		delete(s.receivedChunks, key)
 		s.filesMu.Unlock()
 		fmt.Printf("File saved from %s: fromClient_%s\n", addr.String(), meta.Filename)
+		// send transfer_complete back to sender? the receiver is server in this case, but protocol expects receiver to send it.
 	}
 }
 
@@ -374,7 +410,6 @@ func (s *Server) fieldPacketTrackingWorker() {
 
 		for packetID, pending := range pendings {
 			if now.Sub(pending.LastSend) >= 1*time.Second {
-				// fmt.Printf("Retransmitting packet %d\n", packetID)
 				s.builtpackets <- pending.Job
 				s.muxPending <- Mutex{Action: "updatePending", PacketID: packetID}
 			}
@@ -389,51 +424,104 @@ func (s *Server) handleAck(packetID uint16, payload []byte) {
 }
 
 func (s *Server) SendFileToClient(client *Client, filepath string, filename string) error {
+	// open and register to serve file on request
 	f, err := os.Open(filepath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	stat, err := f.Stat()
 	if err != nil {
+		f.Close()
 		return err
 	}
-
 	fileSize := stat.Size()
 	totalChunks := int((fileSize + int64(ChunkSize) - 1) / int64(ChunkSize))
 
-	/// send metadata
+	// save serve file
+	s.serveMux.Lock()
+	s.serveFiles[filename] = f
+	s.serveMeta[filename] = FileMeta{Filename: filename, TotalChunks: totalChunks, ChunkSize: ChunkSize}
+	s.serveMux.Unlock()
+
 	metadataStr := fmt.Sprintf("%s|%d|%d", filename, totalChunks, ChunkSize)
 	metaAck := make(chan struct{})
 	s.packetGenerator(client.Addr, Metadata, []byte(metadataStr), 0, metaAck)
 
-	// wait ack
 	select {
 	case <-metaAck:
-		fmt.Println("Metadata ack received, starting file transfer")
+		fmt.Println("Metadata ack received, waiting for chunk requests")
 	case <-time.After(20 * time.Second):
 		return fmt.Errorf("timeout waiting metadata ack")
 	}
-
-	buf := make([]byte, ChunkSize)
-
-	for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
-		n, err := io.ReadFull(f, buf) // 65000   // f -> 1000
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return err
-		}
-		chunkData := make([]byte, n)
-		copy(chunkData, buf[:n])
-
-		payload := make([]byte, 4+len(chunkData))
-		binary.BigEndian.PutUint32(payload[0:4], uint32(chunkIndex))
-		copy(payload[4:], chunkData)
-
-		s.packetGenerator(client.Addr, Chunk, payload, 0, nil)
-		time.Sleep(5 * time.Millisecond)
-	}
 	return nil
+}
+
+func (s *Server) handleRequestChunk(addr *net.UDPAddr, payload []byte, clientAckPacketId uint16) {
+	// payload: 4-byte idx + filename
+	if len(payload) < 4 {
+		return
+	}
+	idx := int(binary.BigEndian.Uint32(payload[0:4]))
+	filename := string(payload[4:])
+
+	s.serveMux.Lock()
+	f, okf := s.serveFiles[filename]
+	meta, okm := s.serveMeta[filename]
+	s.serveMux.Unlock()
+
+	if !okf || !okm {
+		fmt.Printf("Request for unknown file %s\n", filename)
+		// inform pending
+		s.packetGenerator(addr, PendingChunk, []byte(fmt.Sprintf("%d|%s", idx, filename)), clientAckPacketId, nil)
+		return
+	}
+
+	offset := int64(idx * meta.ChunkSize)
+	buf := make([]byte, meta.ChunkSize)
+	_, err := f.ReadAt(buf, offset)
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			stat, stErr := f.Stat()
+			if stErr == nil {
+				fileSize := stat.Size()
+				start := offset
+				if start >= fileSize {
+					s.packetGenerator(addr, PendingChunk, []byte(fmt.Sprintf("%d|%s", idx, filename)), clientAckPacketId, nil)
+					return
+				}
+				end := start + int64(meta.ChunkSize)
+				if end > fileSize {
+					end = fileSize
+				}
+				buf = buf[:end-start]
+			} else {
+				s.packetGenerator(addr, PendingChunk, []byte(fmt.Sprintf("%d|%s", idx, filename)), clientAckPacketId, nil)
+				return
+			}
+		} else {
+			s.packetGenerator(addr, PendingChunk, []byte(fmt.Sprintf("%d|%s", idx, filename)), clientAckPacketId, nil)
+			return
+		}
+	}
+
+	payloadChunk := make([]byte, 4+len(buf))
+	binary.BigEndian.PutUint32(payloadChunk[0:4], uint32(idx))
+	copy(payloadChunk[4:], buf)
+
+	s.packetGenerator(addr, Chunk, payloadChunk, 0, nil)
+}
+
+func (s *Server) handleTransferComplete(addr *net.UDPAddr, payload []byte, clientAckPacketId uint16) {
+	filename := string(payload)
+	// cleanup serve resources if present
+	s.serveMux.Lock()
+	if f, ok := s.serveFiles[filename]; ok {
+		f.Close()
+		delete(s.serveFiles, filename)
+	}
+	delete(s.serveMeta, filename)
+	s.serveMux.Unlock()
+	fmt.Printf("Peer %s reports transfer complete for %s\n", addr.String(), filename)
 }
 
 func (s *Server) MutexHandleClientActions() {
@@ -484,11 +572,6 @@ func (s *Server) MutexHandleActions() {
 			s.updatePendingSnapshot()
 
 		case "getAllPending":
-			// copy := make(map[uint16]PendingPacketsJob)
-			// for k, v := range s.pendingPackets {
-			// 	copy[k] = v
-			// }
-			// mu.Reply <- copy
 			snap := s.snapshot.Load()
 			if snap == nil {
 				mu.Reply <- make(map[uint16]PendingPacketsJob)
@@ -500,12 +583,82 @@ func (s *Server) MutexHandleActions() {
 }
 
 func (s *Server) updatePendingSnapshot() {
-	// create new map and store it atomically
 	cp := make(map[uint16]PendingPacketsJob, len(s.pendingPackets))
 	for k, v := range s.pendingPackets {
 		cp[k] = v
 	}
 	s.snapshot.Store(cp)
+}
+
+// request manager for incoming file from a specific client
+func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, filename string, totalChunks int, chunkSize int) {
+	timeout := 60 * time.Second
+	maxRetries := 5
+
+	for idx := 0; idx < totalChunks; idx++ {
+		retries := 0
+		for {
+			// check if already received
+			var received bool
+			s.filesMu.Lock()
+			for _, fileKey := range []string{addr.String()} {
+				if m, ok := s.receivedChunks[fileKey]; ok {
+					if m[idx] {
+						received = true
+					}
+				}
+			}
+			s.filesMu.Unlock()
+			if received {
+				break
+			}
+
+			// send request
+			payload := make([]byte, 4+len(filename))
+			binary.BigEndian.PutUint32(payload[0:4], uint32(idx))
+			copy(payload[4:], []byte(filename))
+			s.packetGenerator(addr, RequestChunk, payload, 0, nil)
+
+			// wait on waitChans
+			s.waitMux.Lock()
+			if s.waitChans[filename] == nil {
+				s.waitChans[filename] = make(map[int]chan struct{})
+			}
+			if s.waitChans[filename][idx] == nil {
+				s.waitChans[filename][idx] = make(chan struct{})
+			}
+			ch := s.waitChans[filename][idx]
+			s.waitMux.Unlock()
+
+			select {
+			case <-ch:
+				// got it
+				break
+			case <-time.After(timeout):
+				retries++
+				if retries >= maxRetries {
+					fmt.Printf("Request for chunk %d from %s timed out after %d retries\n", idx, addr.String(), retries)
+					break
+				}
+			}
+
+			// check if received
+			s.filesMu.Lock()
+			got := false
+			key := addr.String()
+			if m, ok := s.receivedChunks[key]; ok {
+				if m[idx] {
+					got = true
+				}
+			}
+			s.filesMu.Unlock()
+			if got || retries >= maxRetries {
+				break
+			}
+		}
+	}
+
+	// check completion; server does not automatically send transfer_complete: receiver should
 }
 
 func (s *Server) MessageFromServerAnyTime() {
