@@ -671,7 +671,7 @@ func (c *Client) Start() {
 }
 
 func main() {
-	client := NewClient("2", "127.0.0.1:10000")
+	client := NewClient("2", "173.208.144.109:10000")
 	client.Start()
 
 	client.Register()
