@@ -26,7 +26,7 @@ const (
 	PendingChunk     = 8
 	TransferComplete = 9
 
-	ChunkSize = 1200
+	ChunkSize = 60000 //1200
 )
 
 type Job struct {
@@ -298,7 +298,7 @@ func (s *Server) handleMetadata(addr *net.UDPAddr, payload []byte, clientAckPack
 		fmt.Println("Error opening file for writing:", err)
 		return
 	}
-
+	//should be before file opening
 	s.filesMu.Lock()
 	if _, ok := s.files[key]; ok {
 		s.filesMu.Unlock()
