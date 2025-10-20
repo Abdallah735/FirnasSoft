@@ -411,7 +411,7 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 
 func (c *Client) requestManagerForFile(filename string, totalChunks int, chunkSize int) {
 	// simple sequential manager with retry
-	timeout := 2 * time.Second
+	timeout := 60 * time.Second
 	maxRetries := 5
 
 	for idx := 0; idx < totalChunks; idx++ {

@@ -593,7 +593,7 @@ func (s *Server) updatePendingSnapshot() {
 
 // request manager for incoming file from a specific client
 func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, filename string, totalChunks int, chunkSize int) {
-	timeout := 2 * time.Second
+	timeout := 60 * time.Second
 	maxRetries := 5
 
 	for idx := 0; idx < totalChunks; idx++ {
