@@ -142,9 +142,9 @@ func (c *Client) writeWorker(id int) {
 }
 
 func (c *Client) readWorker() {
-	buffer := make([]byte, 65507)
+	//buffer := make([]byte, 65507)
 	for {
-		//buffer := make([]byte, 65507)
+		buffer := make([]byte, 65507)
 		n, _, err := c.conn.ReadFromUDP(buffer)
 		if err != nil {
 			fmt.Println("Error receiving:", err)
@@ -411,7 +411,7 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 
 func (c *Client) requestManagerForFile(filename string, totalChunks int, chunkSize int) {
 	// simple sequential manager with retry
-	timeout := 60 * time.Second
+	timeout := 2 * time.Second
 	maxRetries := 5
 
 	for idx := 0; idx < totalChunks; idx++ {
