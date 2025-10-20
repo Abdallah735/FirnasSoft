@@ -26,7 +26,7 @@ const (
 	PendingChunk     = 8
 	TransferComplete = 9
 
-	ChunkSize = 1400 //1200
+	ChunkSize = 1200
 )
 
 type Job struct {
