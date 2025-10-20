@@ -142,9 +142,9 @@ func (c *Client) writeWorker(id int) {
 }
 
 func (c *Client) readWorker() {
-	//buffer := make([]byte, 65507)
+	buffer := make([]byte, 65507)
 	for {
-		buffer := make([]byte, 65507)
+		//buffer := make([]byte, 65507)
 		n, _, err := c.conn.ReadFromUDP(buffer)
 		if err != nil {
 			fmt.Println("Error receiving:", err)
