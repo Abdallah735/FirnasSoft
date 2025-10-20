@@ -146,8 +146,9 @@ func (s *Server) udpWriteWorker(id int) {
 }
 
 func (s *Server) udpReadWorker() {
-	buf := make([]byte, 65507)
+	//buf := make([]byte, 65507)
 	for {
+		buf := make([]byte, 65507)
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("Read error:", err)

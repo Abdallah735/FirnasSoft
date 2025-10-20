@@ -142,8 +142,9 @@ func (c *Client) writeWorker(id int) {
 }
 
 func (c *Client) readWorker() {
-	buffer := make([]byte, 65507)
+	//buffer := make([]byte, 65507)
 	for {
+		buffer := make([]byte, 65507)
 		n, _, err := c.conn.ReadFromUDP(buffer)
 		if err != nil {
 			fmt.Println("Error receiving:", err)
@@ -671,7 +672,7 @@ func (c *Client) Start() {
 }
 
 func main() {
-	client := NewClient("2", "173.208.144.109:10000")
+	client := NewClient("2", "127.0.0.1:10000") //173.208.144.109
 	client.Start()
 
 	client.Register()
