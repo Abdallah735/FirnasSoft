@@ -807,6 +807,16 @@ func (s *Server) Start() {
 	select {}
 }
 
+func main() {
+	s, err := NewServer(":10000")
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Server running on port 10000...... :)")
+	s.Start()
+}
+
 // package main
 
 // import (
