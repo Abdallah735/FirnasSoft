@@ -25,7 +25,7 @@ const (
 	_pending_chunk     = 8
 	_transfer_complete = 9
 
-	ChunkSize = 10000 //1200
+	ChunkSize = 60000 //1200
 )
 
 type Job struct {
@@ -41,7 +41,6 @@ type GenTask struct {
 	RespChan          chan uint16
 }
 
-// represents command need to be executed on "pendingPackets" sent to "stateChan" and "StateHandler" worker read from "stateChan" & execute it
 type StateCommand struct {
 	Action   string
 	Addr     *net.UDPAddr
@@ -52,7 +51,6 @@ type StateCommand struct {
 	AckChan  chan struct{}
 }
 
-// format for packets to stored in "pendingPackets" map
 type PendingPacketsJob struct {
 	Job
 	LastSend time.Time
@@ -397,6 +395,7 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 		fmt.Printf("File saved from peer: fromPeer_%s\n", filename)
 
 		c.packetGenerator(_transfer_complete, []byte(filename), 0, nil, nil)
+		c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename}
 	}
 }
 
@@ -451,6 +450,7 @@ func (c *Client) requestManagerForFile(filename string, totalChunks int, chunkSi
 	totalRec := (<-replyCount).(int)
 
 	if totalRec >= totalChunks {
+		c.packetGenerator(_transfer_complete, []byte(filename), 0, nil, nil)
 	} else {
 		fmt.Printf("File %s partially received (%d/%d). You may retry later.\n", filename, totalRec, totalChunks)
 	}
@@ -547,6 +547,7 @@ func (c *Client) handlePendingChunk(payload []byte, clientAckPacketId uint16) {
 func (c *Client) handleTransferComplete(payload []byte, clientAckPacketId uint16) {
 	filename := string(payload)
 	c.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Filename: filename}
+	c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename}
 	fmt.Printf("Peer reported transfer complete for %s\n", filename)
 }
 
@@ -687,6 +688,7 @@ func (c *Client) WaitStateHandler() {
 						default:
 							close(ch)
 						}
+						delete(c.waitChans[cmd.Filename], cmd.Idx)
 					}
 				}
 			case "ensureFileChans":
@@ -695,6 +697,13 @@ func (c *Client) WaitStateHandler() {
 				}
 				// assuming we don't create all at once, but code had for i=0 to total make chan
 				// to simplify, perhaps create when needed in ensureChan
+			case "clear":
+				if chmap, ok := c.waitChans[cmd.Filename]; ok {
+					for _, ch := range chmap {
+						close(ch)
+					}
+					delete(c.waitChans, cmd.Filename)
+				}
 			}
 		}
 	}
@@ -732,7 +741,7 @@ func (c *Client) Start() {
 }
 
 func main() {
-	client := NewClient("2", "173.208.144.109:10000") //127.0.0.1
+	client := NewClient("2", "127.0.0.1:10000") //127.0.0.1
 	client.Start()
 
 	client.Register()

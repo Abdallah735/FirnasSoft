@@ -25,7 +25,7 @@ const (
 	PendingChunk     = 8
 	TransferComplete = 9
 
-	ChunkSize = 10000 //1200
+	ChunkSize = 60000 //1200
 )
 
 type Job struct {
@@ -398,6 +398,7 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 		s.fileStateChan <- FileCommand{Action: "closeAndDelete", Key: key}
 		fmt.Printf("File saved from %s: fromClient_%s\n", addr.String(), meta.Filename)
 		s.packetGenerator(addr, TransferComplete, []byte(meta.Filename), 0, nil)
+		s.waitStateChan <- WaitCommand{Action: "clear", Filename: meta.Filename}
 	}
 }
 
@@ -513,6 +514,7 @@ func (s *Server) handleRequestChunk(addr *net.UDPAddr, payload []byte, clientAck
 func (s *Server) handleTransferComplete(addr *net.UDPAddr, payload []byte, clientAckPacketId uint16) {
 	filename := string(payload)
 	s.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Filename: filename}
+	s.waitStateChan <- WaitCommand{Action: "clear", Filename: filename}
 	fmt.Printf("Peer %s reports transfer complete for %s\n", addr.String(), filename)
 }
 
@@ -683,7 +685,15 @@ func (s *Server) WaitStateHandler() {
 						default:
 							close(ch)
 						}
+						delete(s.waitChans[cmd.Filename], cmd.Idx)
 					}
+				}
+			case "clear":
+				if chmap, ok := s.waitChans[cmd.Filename]; ok {
+					for _, ch := range chmap {
+						close(ch)
+					}
+					delete(s.waitChans, cmd.Filename)
 				}
 			}
 		}
@@ -739,6 +749,15 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, filename string, t
 				break
 			}
 		}
+	}
+	replyChRec := make(chan any)
+	s.fileStateChan <- FileCommand{Action: "getReceived", Key: addr.String(), Reply: replyChRec}
+	received := (<-replyChRec).(int)
+	replyChTot := make(chan any)
+	s.fileStateChan <- FileCommand{Action: "getTotal", Key: addr.String(), Reply: replyChTot}
+	total := (<-replyChTot).(int)
+	if received >= total && total > 0 {
+		s.packetGenerator(addr, TransferComplete, []byte(filename), 0, nil)
 	}
 }
 
