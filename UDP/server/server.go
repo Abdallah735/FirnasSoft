@@ -351,8 +351,8 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 	s.fileStateChan <- FileCommand{Action: "checkAndSetReceived", Key: key, Idx: idx, Reply: replyCh}
 	isNew := (<-replyCh).(bool)
 	if !isNew {
-		fmt.Printf("Duplicate chunk %d ignored from %s\n", idx, key)
-		s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d already received", idx)), clientAckPacketId, nil)
+		fmt.Printf("Duplicate chunk %d ignored from %s or metadata not received\n", idx, key)
+		s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d already received or metadata missing", idx)), clientAckPacketId, nil)
 		return
 	}
 
@@ -361,12 +361,18 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 	f := (<-replyChFile).(*os.File)
 	if f == nil {
 		fmt.Println("No file handle for", key)
+		s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d ignored: no file handle", idx)), clientAckPacketId, nil)
 		return
 	}
 
 	replyChMeta := make(chan any)
 	s.fileStateChan <- FileCommand{Action: "getMeta", Key: key, Reply: replyChMeta}
 	meta := (<-replyChMeta).(FileMeta)
+	if meta.Filename == "" {
+		fmt.Println("No metadata for", key)
+		s.packetGenerator(addr, Ack, []byte(fmt.Sprintf("chunk %d ignored: no metadata", idx)), clientAckPacketId, nil)
+		return
+	}
 
 	offset := int64(idx * meta.ChunkSize)
 	_, err := f.WriteAt(data, offset)
@@ -388,9 +394,10 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 	s.fileStateChan <- FileCommand{Action: "getTotal", Key: key, Reply: replyChTot}
 	total := (<-replyChTot).(int)
 
-	if received >= total {
+	if received >= total && total > 0 {
 		s.fileStateChan <- FileCommand{Action: "closeAndDelete", Key: key}
 		fmt.Printf("File saved from %s: fromClient_%s\n", addr.String(), meta.Filename)
+		s.packetGenerator(addr, TransferComplete, []byte(meta.Filename), 0, nil)
 	}
 }
 
@@ -575,6 +582,11 @@ func (s *Server) FileStateHandler() {
 					cmd.Reply <- true
 				}
 			case "checkAndSetReceived":
+				if _, ok := s.receivedChunks[cmd.Key]; !ok {
+					// Key doesn't exist, likely metadata not received yet
+					cmd.Reply <- false
+					continue
+				}
 				if s.receivedChunks[cmd.Key][cmd.Idx] {
 					cmd.Reply <- false
 				} else {
@@ -587,7 +599,11 @@ func (s *Server) FileStateHandler() {
 			case "getFile":
 				cmd.Reply <- s.files[cmd.Key]
 			case "getMeta":
-				cmd.Reply <- s.meta[cmd.Key]
+				if m, ok := s.meta[cmd.Key]; ok {
+					cmd.Reply <- m
+				} else {
+					cmd.Reply <- FileMeta{}
+				}
 			case "getReceived":
 				if m, ok := s.meta[cmd.Key]; ok {
 					cmd.Reply <- m.Received
