@@ -395,12 +395,10 @@ func (s *Server) handleChunk(addr *net.UDPAddr, payload []byte, clientAckPacketI
 	total := (<-replyChTot).(int)
 
 	if received >= total && total > 0 {
-		s.packetGenerator(addr, TransferComplete, []byte(meta.Filename), 0, nil)
-		replyChClear := make(chan any)
-		s.waitStateChan <- WaitCommand{Action: "clear", Filename: meta.Filename, Reply: replyChClear}
-		<-replyChClear
 		s.fileStateChan <- FileCommand{Action: "closeAndDelete", Key: key}
 		fmt.Printf("File saved from %s: fromClient_%s\n", addr.String(), meta.Filename)
+		s.packetGenerator(addr, TransferComplete, []byte(meta.Filename), 0, nil)
+		s.waitStateChan <- WaitCommand{Action: "clear", Filename: meta.Filename}
 	}
 }
 
@@ -515,12 +513,8 @@ func (s *Server) handleRequestChunk(addr *net.UDPAddr, payload []byte, clientAck
 
 func (s *Server) handleTransferComplete(addr *net.UDPAddr, payload []byte, clientAckPacketId uint16) {
 	filename := string(payload)
-	replyCh := make(chan any)
-	s.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Filename: filename, Reply: replyCh}
-	<-replyCh
-	replyCh = make(chan any)
-	s.waitStateChan <- WaitCommand{Action: "clear", Filename: filename, Reply: replyCh}
-	<-replyCh
+	s.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Filename: filename}
+	s.waitStateChan <- WaitCommand{Action: "clear", Filename: filename}
 	fmt.Printf("Peer %s reports transfer complete for %s\n", addr.String(), filename)
 }
 
@@ -691,25 +685,15 @@ func (s *Server) WaitStateHandler() {
 						default:
 							close(ch)
 						}
-						delete(chmap, cmd.Idx)
-						if len(chmap) == 0 {
-							delete(s.waitChans, cmd.Filename)
-						}
+						delete(s.waitChans[cmd.Filename], cmd.Idx)
 					}
 				}
 			case "clear":
 				if chmap, ok := s.waitChans[cmd.Filename]; ok {
 					for _, ch := range chmap {
-						select {
-						case <-ch:
-						default:
-							close(ch)
-						}
+						close(ch)
 					}
 					delete(s.waitChans, cmd.Filename)
-				}
-				if cmd.Reply != nil {
-					cmd.Reply <- struct{}{}
 				}
 			}
 		}
@@ -731,15 +715,6 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, filename string, t
 	for idx := 0; idx < totalChunks; idx++ {
 		retries := 0
 		for {
-			// Check if file state still exists
-			replyChMeta := make(chan any)
-			s.fileStateChan <- FileCommand{Action: "getMeta", Key: addr.String(), Reply: replyChMeta}
-			meta := (<-replyChMeta).(FileMeta)
-			if meta.Filename == "" {
-				fmt.Printf("File %s no longer active, stopping requests\n", filename)
-				return
-			}
-
 			replyCh := make(chan any)
 			s.fileStateChan <- FileCommand{Action: "isReceived", Key: addr.String(), Idx: idx, Reply: replyCh}
 			received := (<-replyCh).(bool)
@@ -775,7 +750,6 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, filename string, t
 			}
 		}
 	}
-
 	replyChRec := make(chan any)
 	s.fileStateChan <- FileCommand{Action: "getReceived", Key: addr.String(), Reply: replyChRec}
 	received := (<-replyChRec).(int)
@@ -784,10 +758,6 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, filename string, t
 	total := (<-replyChTot).(int)
 	if received >= total && total > 0 {
 		s.packetGenerator(addr, TransferComplete, []byte(filename), 0, nil)
-		replyChClear := make(chan any)
-		s.waitStateChan <- WaitCommand{Action: "clear", Filename: filename, Reply: replyChClear}
-		<-replyChClear
-		s.fileStateChan <- FileCommand{Action: "closeAndDelete", Key: addr.String()}
 	}
 }
 
@@ -835,16 +805,6 @@ func (s *Server) Start() {
 	go s.MessageFromServerAnyTime()
 
 	select {}
-}
-
-func main() {
-	s, err := NewServer(":10000")
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println("Server running on port 10000...... :)")
-	s.Start()
 }
 
 // package main

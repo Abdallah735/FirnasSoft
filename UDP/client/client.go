@@ -392,11 +392,10 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 
 	if count >= total {
 		c.receivingStateChan <- ReceivingCommand{Action: "closeFile"}
-		c.packetGenerator(_transfer_complete, []byte(filename), 0, nil, nil)
-		replyChClear := make(chan any)
-		c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename, Reply: replyChClear}
-		<-replyChClear
 		fmt.Printf("File saved from peer: fromPeer_%s\n", filename)
+
+		c.packetGenerator(_transfer_complete, []byte(filename), 0, nil, nil)
+		c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename}
 	}
 }
 
@@ -412,15 +411,6 @@ func (c *Client) requestManagerForFile(filename string, totalChunks int, chunkSi
 			already := (<-replyIs).(bool)
 			if already {
 				break
-			}
-
-			// Check if file state still exists
-			replyName := make(chan any)
-			c.receivingStateChan <- ReceivingCommand{Action: "getFilename", Reply: replyName}
-			currentFilename := (<-replyName).(string)
-			if currentFilename != filename {
-				fmt.Printf("File %s no longer active, stopping requests\n", filename)
-				return
 			}
 
 			payload := make([]byte, 4+len(filename))
@@ -461,9 +451,6 @@ func (c *Client) requestManagerForFile(filename string, totalChunks int, chunkSi
 
 	if totalRec >= totalChunks {
 		c.packetGenerator(_transfer_complete, []byte(filename), 0, nil, nil)
-		replyChClear := make(chan any)
-		c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename, Reply: replyChClear}
-		<-replyChClear
 	} else {
 		fmt.Printf("File %s partially received (%d/%d). You may retry later.\n", filename, totalRec, totalChunks)
 	}
@@ -518,26 +505,9 @@ func (c *Client) handleRequestChunk(payload []byte, clientAckPacketId uint16) {
 		return
 	}
 
-	stat, err := res.F.Stat()
-	if err != nil {
-		fmt.Printf("Error getting file stats for %s: %v\n", filename, err)
-		c.packetGenerator(_pending_chunk, []byte(fmt.Sprintf("%d|%s", idx, filename)), clientAckPacketId, nil, nil)
-		return
-	}
-	fileSize := stat.Size()
-	maxChunks := (fileSize + int64(res.M.ChunkSize) - 1) / int64(res.M.ChunkSize)
-	if int64(idx) >= maxChunks {
-		fmt.Printf("Requested chunk %d for %s exceeds file size\n", idx, filename)
-		c.packetGenerator(_transfer_complete, []byte(filename), clientAckPacketId, nil, nil)
-		replyChClear := make(chan any)
-		c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename, Reply: replyChClear}
-		<-replyChClear
-		return
-	}
-
 	offset := int64(idx * res.M.ChunkSize)
 	buf := make([]byte, res.M.ChunkSize)
-	n, err := res.F.ReadAt(buf, offset)
+	_, err := res.F.ReadAt(buf, offset)
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			stat, stErr := res.F.Stat()
@@ -561,8 +531,6 @@ func (c *Client) handleRequestChunk(payload []byte, clientAckPacketId uint16) {
 			c.packetGenerator(_pending_chunk, []byte(fmt.Sprintf("%d|%s", idx, filename)), clientAckPacketId, nil, nil)
 			return
 		}
-	} else {
-		buf = buf[:n]
 	}
 
 	payloadChunk := make([]byte, 4+len(buf))
@@ -578,12 +546,8 @@ func (c *Client) handlePendingChunk(payload []byte, clientAckPacketId uint16) {
 
 func (c *Client) handleTransferComplete(payload []byte, clientAckPacketId uint16) {
 	filename := string(payload)
-	replyCh := make(chan any)
-	c.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Filename: filename, Reply: replyCh}
-	<-replyCh
-	replyCh = make(chan any)
-	c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename, Reply: replyCh}
-	<-replyCh
+	c.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Filename: filename}
+	c.waitStateChan <- WaitCommand{Action: "clear", Filename: filename}
 	fmt.Printf("Peer reported transfer complete for %s\n", filename)
 }
 
@@ -724,29 +688,21 @@ func (c *Client) WaitStateHandler() {
 						default:
 							close(ch)
 						}
-						delete(chmap, cmd.Idx)
-						if len(chmap) == 0 {
-							delete(c.waitChans, cmd.Filename)
-						}
+						delete(c.waitChans[cmd.Filename], cmd.Idx)
 					}
 				}
 			case "ensureFileChans":
 				if _, ok := c.waitChans[cmd.Filename]; !ok {
 					c.waitChans[cmd.Filename] = make(map[int]chan struct{})
 				}
+				// assuming we don't create all at once, but code had for i=0 to total make chan
+				// to simplify, perhaps create when needed in ensureChan
 			case "clear":
 				if chmap, ok := c.waitChans[cmd.Filename]; ok {
 					for _, ch := range chmap {
-						select {
-						case <-ch:
-						default:
-							close(ch)
-						}
+						close(ch)
 					}
 					delete(c.waitChans, cmd.Filename)
-				}
-				if cmd.Reply != nil {
-					cmd.Reply <- struct{}{}
 				}
 			}
 		}
@@ -785,7 +741,7 @@ func (c *Client) Start() {
 }
 
 func main() {
-	client := NewClient("2", "173.208.144.109:10000")
+	client := NewClient("2", "173.208.144.109:10000") //127.0.0.1
 	client.Start()
 
 	client.Register()
