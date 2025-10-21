@@ -25,7 +25,7 @@ const (
 	_pending_chunk     = 8
 	_transfer_complete = 9
 
-	ChunkSize = 60000 //1200
+	ChunkSize = 10000 //1200
 )
 
 type Job struct {
@@ -41,6 +41,7 @@ type GenTask struct {
 	RespChan          chan uint16
 }
 
+// represents command need to be executed on "pendingPackets" sent to "stateChan" and "StateHandler" worker read from "stateChan" & execute it
 type StateCommand struct {
 	Action   string
 	Addr     *net.UDPAddr
@@ -51,6 +52,7 @@ type StateCommand struct {
 	AckChan  chan struct{}
 }
 
+// format for packets to stored in "pendingPackets" map
 type PendingPacketsJob struct {
 	Job
 	LastSend time.Time
