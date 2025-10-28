@@ -419,7 +419,7 @@ func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize i
 	replyCount := make(chan any)
 	c.receivingStateChan <- ReceivingCommand{Action: "getCount", Key: uuid, Reply: replyCount}
 	totalRec := (<-replyCount).(int)
-	if totalRec+1 >= totalChunks {
+	if totalRec >= totalChunks {
 		c.packetGenerator(_transfer_complete, []byte(uuid), 0, nil, nil)
 	} else {
 		fmt.Printf("File %s partially received (%d/%d). You may retry later.\n", uuid, totalRec, totalChunks)
