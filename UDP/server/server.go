@@ -826,7 +826,7 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, uuid string, total
 	replyChTot := make(chan any)
 	s.fileStateChan <- FileCommand{Action: "getTotal", Key: uuid, Reply: replyChTot}
 	total := (<-replyChTot).(int)
-	if received >= total && total > 0 {
+	if received+1 >= total && total > 0 {
 		s.packetGenerator(addr, TransferComplete, []byte(uuid), 0, nil)
 	}
 }
