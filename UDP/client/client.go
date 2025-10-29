@@ -378,8 +378,10 @@ func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize i
 			ch := (<-replyW).(chan struct{})
 			select {
 			case <-ch:
+				fmt.Printf("chunk receiving case occured for chunk: %v", idx)
 				break
 			case <-time.After(timeout):
+				fmt.Printf("timeout case occred for chunk: %v", idx)
 				// Send status request
 				replyS := make(chan any)
 				c.waitStateChan <- WaitCommand{Action: "ensureStatusChan", Key: uuid, Idx: idx, Reply: replyS}

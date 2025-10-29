@@ -785,8 +785,10 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, uuid string, total
 			ch := (<-replyW).(chan struct{})
 			select {
 			case <-ch:
+				fmt.Printf("chunk receiving case occured for chunk: %v", idx)
 				break
 			case <-time.After(timeout):
+				fmt.Printf("timeout case occred for chunk: %v", idx)
 				// Send status request instead of immediate retry
 				replyS := make(chan any)
 				s.waitStateChan <- WaitCommand{Action: "ensureStatusChan", Key: uuid, Idx: idx, Reply: replyS}
