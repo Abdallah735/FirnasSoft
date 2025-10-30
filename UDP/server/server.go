@@ -783,8 +783,10 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, uuid string, total
 			replyW := make(chan any)
 			s.waitStateChan <- WaitCommand{Action: "ensureChan", Key: uuid, Idx: idx, Reply: replyW}
 			ch := (<-replyW).(chan struct{})
+			var flag bool
 			select {
 			case <-ch:
+				flag = true
 				//fmt.Printf("chunk receiving case occured for chunk: %v\n", idx)
 				break
 			case <-time.After(timeout):
@@ -814,10 +816,14 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, uuid string, total
 					break
 				}
 			}
+
 			replyCh2 := make(chan any)
 			s.fileStateChan <- FileCommand{Action: "isReceived", Key: uuid, Idx: idx, Reply: replyCh2}
 			got := (<-replyCh2).(bool)
 			if got || retries >= maxRetries {
+				break
+			}
+			if flag && idx == totalChunks-1 {
 				break
 			}
 		}
@@ -828,7 +834,7 @@ func (s *Server) requestManagerForIncoming(addr *net.UDPAddr, uuid string, total
 	replyChTot := make(chan any)
 	s.fileStateChan <- FileCommand{Action: "getTotal", Key: uuid, Reply: replyChTot}
 	total := (<-replyChTot).(int)
-	if received >= total && total > 0 {
+	if received+1 >= total && total > 0 {
 		s.packetGenerator(addr, TransferComplete, []byte(uuid), 0, nil)
 	}
 }

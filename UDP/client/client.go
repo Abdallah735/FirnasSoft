@@ -362,7 +362,9 @@ func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize i
 	maxRetries := 5
 	for idx := 0; idx < totalChunks; idx++ {
 		retries := 0
+		// fmt.Println("kkkkkkkkkk", idx, retries)
 		for {
+			// fmt.Println("rrrrrrrrrrr", idx, retries)
 			replyIs := make(chan any)
 			c.receivingStateChan <- ReceivingCommand{Action: "isReceived", Key: uuid, Idx: idx, Reply: replyIs}
 			already := (<-replyIs).(bool)
@@ -376,12 +378,14 @@ func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize i
 			replyW := make(chan any)
 			c.waitStateChan <- WaitCommand{Action: "ensureChan", Key: uuid, Idx: idx, Reply: replyW}
 			ch := (<-replyW).(chan struct{})
+			var flag bool
 			select {
 			case <-ch:
-				//fmt.Printf("chunk receiving case occured for chunk: %v\n", idx)
+				flag = true
+				// fmt.Printf("chunk receiving case occured for chunk: %v\n", idx)
 				break
 			case <-time.After(timeout):
-				//fmt.Printf("timeout case occured for chunk: %v\n", idx)
+				// fmt.Printf("timeout case occured for chunk: %v\n", idx)
 				// Send status request
 				replyS := make(chan any)
 				c.waitStateChan <- WaitCommand{Action: "ensureStatusChan", Key: uuid, Idx: idx, Reply: replyS}
@@ -407,6 +411,7 @@ func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize i
 					break
 				}
 			}
+
 			replyIs2 := make(chan any)
 			c.receivingStateChan <- ReceivingCommand{Action: "isReceived", Key: uuid, Idx: idx, Reply: replyIs2}
 			got := (<-replyIs2).(bool)
@@ -416,12 +421,16 @@ func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize i
 			if retries >= maxRetries {
 				break
 			}
+			if flag && idx == totalChunks-1 {
+				break
+			}
+
 		}
 	}
 	replyCount := make(chan any)
 	c.receivingStateChan <- ReceivingCommand{Action: "getCount", Key: uuid, Reply: replyCount}
 	totalRec := (<-replyCount).(int)
-	if totalRec >= totalChunks {
+	if totalRec+1 >= totalChunks {
 		c.packetGenerator(_transfer_complete, []byte(uuid), 0, nil, nil)
 	} else {
 		fmt.Printf("File %s partially received (%d/%d). You may retry later.\n", uuid, totalRec, totalChunks)
