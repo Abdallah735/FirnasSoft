@@ -1,4 +1,4 @@
-// === client.go (modified with BATCH REQUEST + SLIDING WINDOW) ===
+// === client.go (modified) ===
 package main
 
 import (
@@ -17,30 +17,27 @@ import (
 )
 
 const (
-	_register            = 1
-	_ping                = 2
-	_message             = 3
-	_ack                 = 4
-	_metadata            = 5
-	_chunk               = 6
-	_request_chunk       = 7
-	_pending_chunk       = 8
-	_transfer_complete   = 9
-	_request_status      = 10
-	_in_progress         = 11
-	_already_sent        = 12
-	_not_received        = 13
-	_batch_request_chunk = 14
-	ChunkSize            = 60000
-	UUIDLen              = 36
-	WindowSize           = 20
+	_register          = 1
+	_ping              = 2
+	_message           = 3
+	_ack               = 4
+	_metadata          = 5
+	_chunk             = 6
+	_request_chunk     = 7
+	_pending_chunk     = 8
+	_transfer_complete = 9
+	_request_status    = 10
+	_in_progress       = 11
+	_already_sent      = 12
+	_not_received      = 13
+	ChunkSize          = 60000 //1200
+	UUIDLen            = 36
 )
 
 type Job struct {
 	Addr   *net.UDPAddr
 	Packet []byte
 }
-
 type GenTask struct {
 	MsgType           byte
 	Payload           []byte
@@ -48,7 +45,6 @@ type GenTask struct {
 	AckChan           chan struct{}
 	RespChan          chan uint16
 }
-
 type StateCommand struct {
 	Action   string
 	Addr     *net.UDPAddr
@@ -58,12 +54,10 @@ type StateCommand struct {
 	Reply    chan any
 	AckChan  chan struct{}
 }
-
 type PendingPacketsJob struct {
 	Job
 	LastSend time.Time
 }
-
 type Client struct {
 	id              string
 	serverAddr      *net.UDPAddr
@@ -77,42 +71,39 @@ type Client struct {
 	packetIDCounter uint32
 	rttEstimate     atomic.Value
 	ackPendingMap   map[uint16]chan struct{}
-	//
+	// file receiving, key=uuid
 	files          map[string]*os.File
 	meta           map[string]FileMeta
 	receivedChunks map[string]map[int]bool
 	receivedCount  map[string]int
-	//
+	// serving files (when this client acts as sender), key=uuid
 	serveFiles     map[string]*os.File
 	serveMeta      map[string]FileMeta
 	serveRequested map[string]map[int]bool
 	serveSent      map[string]map[int]bool
-	//
+	// per-file chunk waiters (to notify request-manager that chunk arrived)
 	waitChans          map[string]map[int]chan struct{}
 	statusChans        map[string]map[int]chan byte
 	receivingStateChan chan ReceivingCommand
 	serveStateChan     chan ServeCommand
 	waitStateChan      chan WaitCommand
-	receivingQueue     chan string
+	receivingQueue     chan string // uuids for processing
 }
-
 type ReceivingCommand struct {
 	Action      string
 	Key         string
-	Filename    string
+	Filename    string // display filename for setMetadata
 	TotalChunks int
 	ChunkSize   int
 	File        *os.File
 	Idx         int
 	Reply       chan any
 }
-
 type FileMeta struct {
 	Filename    string
 	TotalChunks int
 	ChunkSize   int
 }
-
 type ServeCommand struct {
 	Action string
 	Key    string
@@ -121,7 +112,6 @@ type ServeCommand struct {
 	Idx    int
 	Reply  chan any
 }
-
 type WaitCommand struct {
 	Action string
 	Key    string
@@ -169,7 +159,6 @@ func NewClient(id string, server string) *Client {
 	c.snapshot.Store(make(map[uint16]PendingPacketsJob))
 	return c
 }
-
 func (c *Client) writeWorker(id int) {
 	for {
 		job := <-c.writeQueue
@@ -179,7 +168,6 @@ func (c *Client) writeWorker(id int) {
 		}
 	}
 }
-
 func (c *Client) readWorker() {
 	for {
 		buffer := make([]byte, 65507)
@@ -193,7 +181,6 @@ func (c *Client) readWorker() {
 		c.parseQueue <- Job{Addr: c.serverAddr, Packet: packet}
 	}
 }
-
 func (c *Client) fieldPacketTrackingWorker() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -215,14 +202,12 @@ func (c *Client) fieldPacketTrackingWorker() {
 		}
 	}
 }
-
 func (c *Client) packetParserWorker() {
 	for {
 		job := <-c.parseQueue
 		c.PacketParser(job.Packet)
 	}
 }
-
 func (c *Client) packetGenerator(msgType byte, payload []byte, clientAckPacketId uint16, ackChan chan struct{}, resp chan uint16) {
 	task := GenTask{
 		MsgType:           msgType,
@@ -233,7 +218,6 @@ func (c *Client) packetGenerator(msgType byte, payload []byte, clientAckPacketId
 	}
 	c.genQueue <- task
 }
-
 func (c *Client) packetGeneratorWorker() {
 	for {
 		task := <-c.genQueue
@@ -243,7 +227,7 @@ func (c *Client) packetGeneratorWorker() {
 		binary.BigEndian.PutUint16(packet[2:4], 0)
 		packet[4] = task.MsgType
 		copy(packet[5:], task.Payload)
-		if task.MsgType != _ack && task.MsgType != _request_chunk && task.MsgType != _pending_chunk && task.MsgType != _transfer_complete && task.MsgType != _request_status && task.MsgType != _in_progress && task.MsgType != _already_sent && task.MsgType != _not_received && task.MsgType != _batch_request_chunk {
+		if task.MsgType != _ack && task.MsgType != _request_chunk && task.MsgType != _pending_chunk && task.MsgType != _transfer_complete && task.MsgType != _request_status && task.MsgType != _in_progress && task.MsgType != _already_sent && task.MsgType != _not_received {
 			binary.BigEndian.PutUint16(packet[0:2], packetID)
 			c.stateChan <- StateCommand{Action: "addPending", PacketID: packetID, Packet: packet}
 			if task.AckChan != nil {
@@ -258,7 +242,6 @@ func (c *Client) packetGeneratorWorker() {
 		c.writeQueue <- Job{Addr: c.serverAddr, Packet: packet}
 	}
 }
-
 func (c *Client) PacketParser(packet []byte) {
 	if len(packet) < 5 {
 		return
@@ -287,25 +270,19 @@ func (c *Client) PacketParser(packet []byte) {
 		c.handleRequestStatus(payload, packetID)
 	case _in_progress, _already_sent, _not_received:
 		c.handleStatusResponse(msgType, payload, packetID)
-	case _batch_request_chunk:
-		c.handleBatchRequestChunk(payload, packetID)
 	}
 }
-
 func (c *Client) Register() {
 	c.packetGenerator(_register, []byte(c.id), 0, nil, nil)
 	fmt.Println("register:", c.id)
 }
-
 func (c *Client) Ping() {
 	c.packetGenerator(_ping, []byte("ping"), 0, nil, nil)
 	fmt.Println("ping")
 }
-
 func (c *Client) SendMessage(message string) {
 	c.packetGenerator(_message, []byte(message), 0, nil, nil)
 }
-
 func (c *Client) handleMetadata(payload []byte, clientAckPacketId uint16) {
 	meta := string(payload)
 	parts := strings.Split(meta, "|")
@@ -330,7 +307,6 @@ func (c *Client) handleMetadata(payload []byte, clientAckPacketId uint16) {
 	fmt.Printf("Metadata received: %s (%d chunks, %d bytes each)\n", filename, totalChunks, chunkSize)
 	c.receivingQueue <- uuid
 }
-
 func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 	if len(payload) < 4+UUIDLen {
 		return
@@ -339,15 +315,14 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 	uuid := string(payload[4 : 4+UUIDLen])
 	data := make([]byte, len(payload)-4-UUIDLen)
 	copy(data, payload[4+UUIDLen:])
-
 	replyIs := make(chan any)
 	c.receivingStateChan <- ReceivingCommand{Action: "isReceived", Key: uuid, Idx: idx, Reply: replyIs}
 	isDup := (<-replyIs).(bool)
 	if isDup {
+		fmt.Printf("Duplicate chunk %d ignored\n", idx)
 		c.packetGenerator(_ack, []byte(fmt.Sprintf("chunk %d already received", idx)), clientAckPacketId, nil, nil)
 		return
 	}
-
 	c.receivingStateChan <- ReceivingCommand{Action: "setReceived", Key: uuid, Idx: idx}
 	replyFile := make(chan any)
 	c.receivingStateChan <- ReceivingCommand{Action: "getFile", Key: uuid, Reply: replyFile}
@@ -366,113 +341,101 @@ func (c *Client) handleChunk(payload []byte, clientAckPacketId uint16) {
 	}
 	c.waitStateChan <- WaitCommand{Action: "notify", Key: uuid, Idx: idx}
 	c.receivingStateChan <- ReceivingCommand{Action: "incrementCount", Key: uuid}
-	c.packetGenerator(_ack, []byte(fmt.Sprintf("chunk %d received", idx)), clientAckPacketId, nil, nil)
-	fmt.Printf("Chunk %d received (%s)\n", idx, filename)
-}
-
-func (c *Client) handleBatchRequestChunk(payload []byte, clientAckPacketId uint16) {
-	if len(payload) < 8+UUIDLen {
-		return
-	}
-	start := int(binary.BigEndian.Uint32(payload[0:4]))
-	end := int(binary.BigEndian.Uint32(payload[4:8]))
-	uuid := string(payload[8 : 8+UUIDLen])
-
-	replyCh := make(chan any)
-	c.serveStateChan <- ServeCommand{Action: "getServe", Key: uuid, Reply: replyCh}
-	res := (<-replyCh).(struct {
-		F  *os.File
-		M  FileMeta
-		Ok bool
-	})
-	if !res.Ok {
-		return
-	}
-
-	for idx := start; idx < end; idx++ {
-		replySent := make(chan any)
-		c.serveStateChan <- ServeCommand{Action: "getSent", Key: uuid, Idx: idx, Reply: replySent}
-		if (<-replySent).(bool) {
-			continue
-		}
-
-		offset := int64(idx * res.M.ChunkSize)
-		buf := make([]byte, res.M.ChunkSize)
-		n, err := res.F.ReadAt(buf, offset)
-		if err != nil && err != io.EOF {
-			continue
-		}
-		if n == 0 {
-			continue
-		}
-		if err == io.EOF {
-			buf = buf[:n]
-		}
-
-		chunkPayload := make([]byte, 4+UUIDLen+len(buf))
-		binary.BigEndian.PutUint32(chunkPayload[0:4], uint32(idx))
-		copy(chunkPayload[4:4+UUIDLen], []byte(uuid))
-		copy(chunkPayload[4+UUIDLen:], buf)
-
-		c.packetGenerator(_chunk, chunkPayload, 0, nil, nil)
-		c.serveStateChan <- ServeCommand{Action: "setSent", Key: uuid, Idx: idx}
-	}
-}
-
-func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize int) {
-	// Phase 1: Send batch requests
-	for start := 0; start < totalChunks; start += WindowSize {
-		end := start + WindowSize
-		if end > totalChunks {
-			end = totalChunks
-		}
-		payload := make([]byte, 8+UUIDLen)
-		binary.BigEndian.PutUint32(payload[0:4], uint32(start))
-		binary.BigEndian.PutUint32(payload[4:8], uint32(end))
-		copy(payload[8:], []byte(uuid))
-		c.packetGenerator(_batch_request_chunk, payload, 0, nil, nil)
-	}
-
-	time.Sleep(3 * time.Second)
-
-	// Phase 2: Re-request missing chunks
-	missing := []int{}
-	reply := make(chan any)
-	c.receivingStateChan <- ReceivingCommand{Action: "getMissing", Key: uuid, TotalChunks: totalChunks, Reply: reply}
-	missing = (<-reply).([]int)
-
-	for len(missing) > 0 {
-		for i := 0; i < len(missing); i += WindowSize {
-			end := i + WindowSize
-			if end > len(missing) {
-				end = len(missing)
-			}
-			startIdx := missing[i]
-			endIdx := missing[end-1]
-			payload := make([]byte, 8+UUIDLen)
-			binary.BigEndian.PutUint32(payload[0:4], uint32(startIdx))
-			binary.BigEndian.PutUint32(payload[4:8], uint32(endIdx))
-			copy(payload[8:], []byte(uuid))
-			c.packetGenerator(_batch_request_chunk, payload, 0, nil, nil)
-		}
-		time.Sleep(2 * time.Second)
-		c.receivingStateChan <- ReceivingCommand{Action: "getMissing", Key: uuid, TotalChunks: totalChunks, Reply: reply}
-		missing = (<-reply).([]int)
-	}
-
-	// Final check
 	replyCount := make(chan any)
 	c.receivingStateChan <- ReceivingCommand{Action: "getCount", Key: uuid, Reply: replyCount}
 	count := (<-replyCount).(int)
-	if count >= totalChunks {
-		c.packetGenerator(_transfer_complete, []byte(uuid), 0, nil, nil)
+	replyTotal := make(chan any)
+	c.receivingStateChan <- ReceivingCommand{Action: "getTotal", Key: uuid, Reply: replyTotal}
+	total := (<-replyTotal).(int)
+	c.packetGenerator(_ack, []byte(fmt.Sprintf("chunk %d received", idx)), clientAckPacketId, nil, nil)
+	fmt.Printf("Chunk %d received and written (%d/%d)\n", idx, count, total)
+	if count >= total {
 		c.receivingStateChan <- ReceivingCommand{Action: "closeFile", Key: uuid}
-		fmt.Printf("File fully received: %s\n", uuid)
-	} else {
-		fmt.Printf("File partially received (%d/%d)\n", count, totalChunks)
+		fmt.Printf("File saved from peer: fromPeer_%s\n", filename)
+		c.packetGenerator(_transfer_complete, []byte(uuid), 0, nil, nil)
+		c.waitStateChan <- WaitCommand{Action: "clear", Key: uuid}
+		c.waitStateChan <- WaitCommand{Action: "clearStatus", Key: uuid}
 	}
 }
+func (c *Client) requestManagerForFile(uuid string, totalChunks int, chunkSize int) {
+	timeout := 60 * time.Second
+	maxRetries := 5
+	for idx := 0; idx < totalChunks; idx++ {
+		retries := 0
+		// fmt.Println("kkkkkkkkkk", idx, retries)
+		for {
+			// fmt.Println("rrrrrrrrrrr", idx, retries)
+			replyIs := make(chan any)
+			c.receivingStateChan <- ReceivingCommand{Action: "isReceived", Key: uuid, Idx: idx, Reply: replyIs}
+			already := (<-replyIs).(bool)
+			if already {
+				break
+			}
+			payload := make([]byte, 4+UUIDLen)
+			binary.BigEndian.PutUint32(payload[0:4], uint32(idx))
+			copy(payload[4:], []byte(uuid))
+			c.packetGenerator(_request_chunk, payload, 0, nil, nil)
+			replyW := make(chan any)
+			c.waitStateChan <- WaitCommand{Action: "ensureChan", Key: uuid, Idx: idx, Reply: replyW}
+			ch := (<-replyW).(chan struct{})
+			var flag bool
+			select {
+			case <-ch:
+				flag = true
+				// fmt.Printf("chunk receiving case occured for chunk: %v\n", idx)
+				break
+			case <-time.After(timeout):
+				// fmt.Printf("timeout case occured for chunk: %v\n", idx)
+				// Send status request
+				replyS := make(chan any)
+				c.waitStateChan <- WaitCommand{Action: "ensureStatusChan", Key: uuid, Idx: idx, Reply: replyS}
+				stCh := (<-replyS).(chan byte)
+				payloadS := make([]byte, 4+UUIDLen)
+				binary.BigEndian.PutUint32(payloadS[0:4], uint32(idx))
+				copy(payloadS[4:], []byte(uuid))
+				c.packetGenerator(_request_status, payloadS, 0, nil, nil)
+				select {
+				case status := <-stCh:
+					if status == _in_progress {
+						// Wait more
+						continue
+					} else {
+						// AlreadySent or NotReceived: retry
+						retries++
+					}
+				case <-time.After(10 * time.Second):
+					retries++
+				}
+				if retries >= maxRetries {
+					fmt.Printf("Chunk %d failed after %d retries, continuing to next (uuid=%s)\n", idx, retries, uuid)
+					break
+				}
+			}
 
+			replyIs2 := make(chan any)
+			c.receivingStateChan <- ReceivingCommand{Action: "isReceived", Key: uuid, Idx: idx, Reply: replyIs2}
+			got := (<-replyIs2).(bool)
+			if got {
+				break
+			}
+			if retries >= maxRetries {
+				break
+			}
+			if flag && idx == totalChunks-1 {
+				break
+			}
+
+		}
+	}
+	replyCount := make(chan any)
+	c.receivingStateChan <- ReceivingCommand{Action: "getCount", Key: uuid, Reply: replyCount}
+	totalRec := (<-replyCount).(int)
+	if totalRec+1 >= totalChunks {
+		c.packetGenerator(_transfer_complete, []byte(uuid), 0, nil, nil)
+	} else {
+		fmt.Printf("File %s partially received (%d/%d). You may retry later.\n", uuid, totalRec, totalChunks)
+	}
+}
 func (c *Client) SendFileToServer(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -493,26 +456,65 @@ func (c *Client) SendFileToServer(path string) error {
 	c.packetGenerator(_metadata, []byte(metadataStr), 0, metaAck, nil)
 	select {
 	case <-metaAck:
-		fmt.Println("Metadata ack received, waiting for batch requests")
+		fmt.Println("Metadata ack received by server, waiting for chunk requests")
 	case <-time.After(20 * time.Second):
 		return fmt.Errorf("timeout waiting metadata ack")
 	}
 	return nil
 }
-
 func (c *Client) handleRequestChunk(payload []byte, clientAckPacketId uint16) {
-	// fallback for old clients
-	if len(payload) >= 4+UUIDLen {
-		idx := int(binary.BigEndian.Uint32(payload[0:4]))
-		uuid := string(payload[4 : 4+UUIDLen])
-		fakeBatch := make([]byte, 8+UUIDLen)
-		binary.BigEndian.PutUint32(fakeBatch[0:4], uint32(idx))
-		binary.BigEndian.PutUint32(fakeBatch[4:8], uint32(idx+1))
-		copy(fakeBatch[8:], []byte(uuid))
-		c.handleBatchRequestChunk(fakeBatch, clientAckPacketId)
+	if len(payload) < 4+UUIDLen {
+		return
 	}
+	idx := int(binary.BigEndian.Uint32(payload[0:4]))
+	uuid := string(payload[4 : 4+UUIDLen])
+	replyCh := make(chan any)
+	c.serveStateChan <- ServeCommand{Action: "getServe", Key: uuid, Reply: replyCh}
+	res := (<-replyCh).(struct {
+		F  *os.File
+		M  FileMeta
+		Ok bool
+	})
+	if !res.Ok {
+		fmt.Printf("Received request for unknown file %s\n", uuid)
+		c.packetGenerator(_pending_chunk, []byte(fmt.Sprintf("%d|%s", idx, uuid)), clientAckPacketId, nil, nil)
+		return
+	}
+	c.serveStateChan <- ServeCommand{Action: "setRequested", Key: uuid, Idx: idx}
+	offset := int64(idx * res.M.ChunkSize)
+	buf := make([]byte, res.M.ChunkSize)
+	_, err := res.F.ReadAt(buf, offset)
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			stat, stErr := res.F.Stat()
+			if stErr == nil {
+				fileSize := stat.Size()
+				start := offset
+				if start >= fileSize {
+					c.packetGenerator(_pending_chunk, []byte(fmt.Sprintf("%d|%s", idx, uuid)), clientAckPacketId, nil, nil)
+					return
+				}
+				end := start + int64(res.M.ChunkSize)
+				if end > fileSize {
+					end = fileSize
+				}
+				buf = buf[:end-start]
+			} else {
+				c.packetGenerator(_pending_chunk, []byte(fmt.Sprintf("%d|%s", idx, uuid)), clientAckPacketId, nil, nil)
+				return
+			}
+		} else {
+			c.packetGenerator(_pending_chunk, []byte(fmt.Sprintf("%d|%s", idx, uuid)), clientAckPacketId, nil, nil)
+			return
+		}
+	}
+	payloadChunk := make([]byte, 4+UUIDLen+len(buf))
+	binary.BigEndian.PutUint32(payloadChunk[0:4], uint32(idx))
+	copy(payloadChunk[4:4+UUIDLen], []byte(uuid))
+	copy(payloadChunk[4+UUIDLen:], buf)
+	c.packetGenerator(_chunk, payloadChunk, 0, nil, nil)
+	c.serveStateChan <- ServeCommand{Action: "setSent", Key: uuid, Idx: idx}
 }
-
 func (c *Client) handleRequestStatus(payload []byte, clientAckPacketId uint16) {
 	if len(payload) < 4+UUIDLen {
 		return
@@ -546,8 +548,7 @@ func (c *Client) handleRequestStatus(payload []byte, clientAckPacketId uint16) {
 	}
 	c.packetGenerator(_already_sent, payload, clientAckPacketId, nil, nil)
 }
-
-func (c *Client) handleStatusResponse(msgType byte, payload []byte, packetID uint16) {
+func (c *Client) handleStatusResponse(msgType byte, payload []byte, clientAckPacketId uint16) {
 	if len(payload) < 4+UUIDLen {
 		return
 	}
@@ -555,11 +556,9 @@ func (c *Client) handleStatusResponse(msgType byte, payload []byte, packetID uin
 	uuid := string(payload[4 : 4+UUIDLen])
 	c.waitStateChan <- WaitCommand{Action: "notifyStatus", Key: uuid, Idx: idx, Status: msgType}
 }
-
 func (c *Client) handlePendingChunk(payload []byte, clientAckPacketId uint16) {
-	// يمكن تجاهله أو استخدامه لاحقاً
+	fmt.Println("Received pending info:", string(payload))
 }
-
 func (c *Client) handleTransferComplete(payload []byte, clientAckPacketId uint16) {
 	uuid := string(payload)
 	replyMeta := make(chan any)
@@ -568,9 +567,8 @@ func (c *Client) handleTransferComplete(payload []byte, clientAckPacketId uint16
 	c.serveStateChan <- ServeCommand{Action: "closeAndDeleteServe", Key: uuid}
 	c.waitStateChan <- WaitCommand{Action: "clear", Key: uuid}
 	c.waitStateChan <- WaitCommand{Action: "clearStatus", Key: uuid}
-	fmt.Printf("Server reports transfer complete for %s\n", meta.Filename)
+	fmt.Printf("Peer reported transfer complete for %s\n", meta.Filename)
 }
-
 func (c *Client) StateHandler() {
 	for {
 		select {
@@ -589,24 +587,29 @@ func (c *Client) StateHandler() {
 					c.updatePendingSnapshot()
 				}
 			case "deletePending":
+				if p, ok := c.pendingPackets[cmd.PacketID]; ok {
+					rtt := time.Since(p.LastSend)
+					old := c.rttEstimate.Load().(time.Duration)
+					newRTT := (old*7 + rtt) / 8
+					c.rttEstimate.Store(newRTT)
+				}
 				delete(c.pendingPackets, cmd.PacketID)
 				if ch, ok := c.ackPendingMap[cmd.PacketID]; ok {
 					close(ch)
 					delete(c.ackPendingMap, cmd.PacketID)
 				}
 				c.updatePendingSnapshot()
+			case "getAllPending":
+				snap := c.snapshot.Load().(map[uint16]PendingPacketsJob)
+				cmd.Reply <- snap
 			case "registerAck":
 				if cmd.AckChan != nil {
 					c.ackPendingMap[cmd.PacketID] = cmd.AckChan
 				}
-			case "getAllPending":
-				snap := c.snapshot.Load().(map[uint16]PendingPacketsJob)
-				cmd.Reply <- snap
 			}
 		}
 	}
 }
-
 func (c *Client) ReceivingStateHandler() {
 	for {
 		select {
@@ -619,9 +622,6 @@ func (c *Client) ReceivingStateHandler() {
 					c.files[cmd.Key] = cmd.File
 					c.meta[cmd.Key] = FileMeta{Filename: cmd.Filename, TotalChunks: cmd.TotalChunks, ChunkSize: cmd.ChunkSize}
 					c.receivedChunks[cmd.Key] = make(map[int]bool)
-					for i := 0; i < cmd.TotalChunks; i++ {
-						c.receivedChunks[cmd.Key][i] = false
-					}
 					c.receivedCount[cmd.Key] = 0
 					cmd.Reply <- true
 				}
@@ -667,23 +667,16 @@ func (c *Client) ReceivingStateHandler() {
 				delete(c.meta, cmd.Key)
 				delete(c.receivedChunks, cmd.Key)
 				delete(c.receivedCount, cmd.Key)
-			case "getMissing":
-				if m, ok := c.receivedChunks[cmd.Key]; ok {
-					missing := []int{}
-					for i := 0; i < cmd.TotalChunks; i++ {
-						if !m[i] {
-							missing = append(missing, i)
-						}
-					}
-					cmd.Reply <- missing
+			case "getMeta":
+				if m, ok := c.meta[cmd.Key]; ok {
+					cmd.Reply <- m
 				} else {
-					cmd.Reply <- []int{}
+					cmd.Reply <- FileMeta{}
 				}
 			}
 		}
 	}
 }
-
 func (c *Client) ServeStateHandler() {
 	for {
 		select {
@@ -745,7 +738,6 @@ func (c *Client) ServeStateHandler() {
 		}
 	}
 }
-
 func (c *Client) WaitStateHandler() {
 	for {
 		select {
@@ -807,7 +799,6 @@ func (c *Client) WaitStateHandler() {
 		}
 	}
 }
-
 func (c *Client) updatePendingSnapshot() {
 	cp := make(map[uint16]PendingPacketsJob, len(c.pendingPackets))
 	for k, v := range c.pendingPackets {
@@ -815,7 +806,6 @@ func (c *Client) updatePendingSnapshot() {
 	}
 	c.snapshot.Store(cp)
 }
-
 func (c *Client) receivingWorker() {
 	for uuid := range c.receivingQueue {
 		replyMeta := make(chan any)
@@ -824,7 +814,6 @@ func (c *Client) receivingWorker() {
 		c.requestManagerForFile(uuid, meta.TotalChunks, meta.ChunkSize)
 	}
 }
-
 func (c *Client) Start() {
 	go c.StateHandler()
 	go c.ReceivingStateHandler()
@@ -833,17 +822,20 @@ func (c *Client) Start() {
 	for i := 0; i < 10; i++ {
 		go c.receivingWorker()
 	}
-	for i := 0; i < 5; i++ {
+	for i := 1; i <= 1; i++ {
 		go c.writeWorker(i)
+	}
+	for i := 1; i <= 1; i++ {
 		go c.packetGeneratorWorker()
 	}
 	go c.readWorker()
-	go c.packetParserWorker()
+	for i := 1; i <= 1; i++ {
+		go c.packetParserWorker()
+	}
 	go c.fieldPacketTrackingWorker()
 }
-
 func main() {
-	client := NewClient("2", "173.208.144.109:10000")
+	client := NewClient("2", "173.208.144.109:10000") //127.0.0.1   //173.208.144.109
 	client.Start()
 	client.Register()
 	ticker := time.NewTicker(28 * time.Second)
@@ -866,3 +858,90 @@ func main() {
 		client.SendMessage(input)
 	}
 }
+
+// package main
+
+// import (
+// 	"bufio"
+// 	"fmt"
+// 	"net"
+// 	"os"
+// 	"strings"
+// 	"time"
+// )
+
+// type UDPClient struct {
+// 	serverAddr *net.UDPAddr
+// 	conn       *net.UDPConn
+// }
+
+// func NewUDPClient(server string) (*UDPClient, error) {
+// 	addr, err := net.ResolveUDPAddr("udp", server)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("error resolving server address: %v", err)
+// 	}
+
+// 	conn, err := net.DialUDP("udp", nil, addr)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("error dialing server: %v", err)
+// 	}
+
+// 	return &UDPClient{serverAddr: addr, conn: conn}, nil
+// }
+
+// func (c *UDPClient) Start() {
+// 	fmt.Println("UDP client started. Connected to", c.serverAddr.String())
+// 	fmt.Println("Type messages and press Enter (type 'exit' to quit).")
+
+// 	go func() {
+// 		buffer := make([]byte, 1024)
+// 		for {
+// 			n, _, err := c.conn.ReadFromUDP(buffer)
+// 			if err != nil {
+// 				fmt.Println("Error reading from server:", err)
+// 				continue
+// 			}
+// 			fmt.Println("\n[Server]:", string(buffer[:n]))
+// 			fmt.Print(">> ")
+// 		}
+// 	}()
+
+// 	go func() {
+// 		ticker := time.NewTicker(28 * time.Second)
+// 		defer ticker.Stop()
+// 		for range ticker.C {
+// 			_, err := c.conn.Write([]byte("PING"))
+// 			if err != nil {
+// 				fmt.Println("Error sending keep-alive msg:", err)
+// 			}
+// 		}
+// 	}()
+
+// 	reader := bufio.NewReader(os.Stdin)
+// 	for {
+// 		fmt.Print(">> ")
+// 		text, _ := reader.ReadString('\n')
+// 		text = strings.TrimSpace(text)
+
+// 		if text == "exit" {
+// 			fmt.Println("Client exiting...")
+// 			break
+// 		}
+
+// 		_, err := c.conn.Write([]byte(text))
+// 		if err != nil {
+// 			fmt.Println("Error writing to server:", err)
+// 		}
+// 	}
+// }
+
+// func main() {
+// 	client, err := NewUDPClient("127.0.0.1:10000")
+// 	if err != nil {
+// 		fmt.Println("Error:", err)
+// 		return
+// 	}
+// 	defer client.conn.Close()
+
+// 	client.Start()
+// }
